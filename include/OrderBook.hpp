@@ -1,0 +1,87 @@
+#pragma once
+
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+#include <iostream>
+
+// 1. The Core Order Data Structure
+struct Order {
+    uint64_t id;
+    uint32_t price;
+    uint32_t qty;
+    bool is_buy;
+
+    // Intrusive pointers for O(1) doubly-linked list insertion and removal
+    Order* next = nullptr;
+    Order* prev = nullptr;
+};
+
+// 2. The Price Level Data Structure
+struct PriceLevel {
+    uint32_t price;
+    uint64_t total_volume = 0;
+    uint32_t order_count = 0;
+
+    Order* head = nullptr;
+    Order* tail = nullptr;
+
+    // Helper method to add an order to the back of the queue (Time Priority)
+    void append_order(Order* order) {
+        order->next = nullptr;
+        order->prev = tail;
+        if (tail) {
+            tail->next = order;
+        } else {
+            head = order;
+        }
+        tail = order;
+        total_volume += order->qty;
+        order_count++;
+    }
+
+    // Helper method to unlink an order from anywhere in the list in O(1)
+    void remove_order(Order* order) {
+        if (order->prev) order->prev->next = order->next;
+        if (order->next) order->next->prev = order->prev;
+        if (order == head) head = order->next;
+        if (order == tail) tail = order->prev;
+
+        total_volume -= order->qty;
+        order_count--;
+        order->next = nullptr;
+        order->prev = nullptr;
+    }
+};
+
+// 3. The OrderBook Class Interface
+class OrderBook {
+private:
+    // Fixed array for direct O(1) price-level lookup (e.g., tick index)
+    static constexpr size_t MAX_PRICE_LEVELS = 100000;
+    PriceLevel* bids[MAX_PRICE_LEVELS] = {nullptr};
+    PriceLevel* asks[MAX_PRICE_LEVELS] = {nullptr};
+
+    // Quick lookup from Order ID directly to the Order struct for O(1) cancels
+    std::unordered_map<uint64_t, Order*> order_map;
+
+    // Tracking current best bid and ask prices
+    uint32_t best_bid_price = 0;
+    uint32_t best_ask_price = 0xFFFFFFFF;
+
+public:
+    OrderBook() = default;
+    ~OrderBook();
+
+    // Prevent copying to ensure deterministic memory behavior
+    OrderBook(const OrderBook&) = delete;
+    OrderBook& operator=(const OrderBook&) = delete;
+
+    // Core Matching Engine Methods
+    void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy);
+    void cancel_order(uint64_t id);
+
+    // Getters for current top-of-book (Spread)
+    uint32_t get_best_bid() const { return best_bid_price; }
+    uint32_t get_best_ask() const { return best_ask_price; }
+};
