@@ -21,16 +21,42 @@ This project implements the core matching logic used in real exchange systems: o
 
 ## Performance
 
-Benchmarked on 100,000 randomized order operations (inserts, executions, cancellations), compiled with `-O3`.
+[#performance](#performance)
 
-| Metric | Result |
-|---|---|
-| Average Latency | 225.74 ns / order |
-| Throughput | 3.25M ops/sec |
-| Total Execution Time | ~30.76 ms (100k orders) |
+Benchmarked on 100,000 randomized order operations (inserts, executions, cancellations), compiled with `-O3`. Timed using `QueryPerformanceCounter` for reliable nanosecond-resolution measurement on Windows.
+
+| Metric               | Result                  |
+| -------------------- | ------------------------ |
+| Throughput           | 4.30M ops/sec             |
+| Total Execution Time | ~23.28 ms (100k orders)   |
+
+Latency is reported separately for resting inserts (no match) and crossing inserts (matched against the book), since a multi-level matching sweep is a fundamentally different cost than an O(1) resting insert — a single blended average hides that distinction.
+
+**Resting inserts (no match)** — n=55,804
+
+| Percentile | Latency    |
+| ---------- | ---------- |
+| avg        | 185.5 ns   |
+| p50        | 200 ns     |
+| p90        | 200 ns     |
+| p99        | 400 ns     |
+| p99.9      | 1,000 ns   |
+| max        | 213,500 ns |
+
+**Crossing inserts (matched against book)** — n=44,196
+
+| Percentile | Latency    |
+| ---------- | ---------- |
+| avg        | 166.1 ns   |
+| p50        | 100 ns     |
+| p90        | 300 ns     |
+| p99        | 500 ns     |
+| p99.9      | 900 ns     |
+| max        | 102,700 ns |
+
+> The max values above are 100-200x larger than p99.9, which points to OS scheduler jitter (context switches, page faults) rather than the matching engine itself — the p99.9 column is the more representative worst case for the algorithm's actual behavior.
 
 **Test Environment:** Windows 11, Intel Core i7 / AMD Ryzen 7, GCC 13.2 (MinGW-w64)
-
 > Latency numbers are meaningless without hardware context — always report the machine a benchmark ran on.
 
 ## Design & Architecture
