@@ -21,8 +21,6 @@ This project implements the core matching logic used in real exchange systems: o
 
 ## Performance
 
-[#performance](#performance)
-
 Benchmarked on 100,000 randomized order operations (inserts, executions, cancellations), compiled with `-O3`. Timed using `QueryPerformanceCounter` for reliable nanosecond-resolution measurement on Windows.
 
 | Metric               | Result                  |
