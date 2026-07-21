@@ -87,6 +87,17 @@ public:
     // Getters for current top-of-book (Spread)
     uint32_t get_best_bid() const { return best_bid_price; }
     uint32_t get_best_ask() const { return best_ask_price; }
+
+    // Read-only access to a price level, for tests that need to verify
+    // FIFO ordering and volume/count bookkeeping rather than just the
+    // top-of-book price.
+    const PriceLevel* get_bid_level(uint32_t price) const {
+        return (price < MAX_PRICE_LEVELS) ? bids[price] : nullptr;
+    }
+    const PriceLevel* get_ask_level(uint32_t price) const {
+        return (price < MAX_PRICE_LEVELS) ? asks[price] : nullptr;
+    }
+
     private:
     MemoryPool<Order> order_pool;
 };

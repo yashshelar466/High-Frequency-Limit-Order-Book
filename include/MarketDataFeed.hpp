@@ -39,7 +39,16 @@ public:
                 order_book.cancel_order(tick.order_id);
                 break;
             case EventType::EXECUTE:
-                // Execution handled automatically during insert matching in OrderBook
+                // Executions are implicit: they happen automatically inside
+                // OrderBook::insert_order's matching loop, not as a
+                // separate event. If the feed ever carries EXECUTE ticks
+                // from a real exchange source (rather than being purely
+                // synthetic ADD/CANCEL data), that's a sign the data model
+                // doesn't match this engine's assumptions — surface it
+                // instead of dropping it silently.
+                std::cerr << "Warning: EXECUTE tick for order " << tick.order_id
+                          << " ignored (executions are derived, not replayed)."
+                          << std::endl;
                 break;
         }
     }

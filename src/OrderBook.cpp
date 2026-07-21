@@ -40,8 +40,11 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
                 order_pool.deallocate(resting_order);
             }
 
-            // Move best ask forward if level fully depleted
+            // Level fully depleted: free it (mirrors cancel_order's cleanup)
+            // and move best ask forward.
             if (level->order_count == 0) {
+                delete asks[best_ask_price];
+                asks[best_ask_price] = nullptr;
                 best_ask_price++;
             }
         }
@@ -67,8 +70,10 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
                 order_pool.deallocate(resting_order);
             }
 
-            if (level->order_count == 0 && best_bid_price > 0) {
-                best_bid_price--;
+            if (level->order_count == 0) {
+                delete bids[best_bid_price];
+                bids[best_bid_price] = nullptr;
+                if (best_bid_price > 0) best_bid_price--;
             }
         }
     }
