@@ -3,8 +3,8 @@
 
 OrderBook::~OrderBook() {
     // Clean up allocated PriceLevels and Orders
-for (auto& order_pair : order_map) {
-    delete order_pair.second;
+    for (auto& order_pair : order_map) {
+        order_pool.deallocate(order_pair.second);
     }
     for (size_t i = 0; i < MAX_PRICE_LEVELS; ++i) {
         delete bids[i];
@@ -37,7 +37,7 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
             if (resting_order->qty == 0) {
                 level->remove_order(resting_order);
                 order_map.erase(resting_order->id);
-                delete resting_order;
+                order_pool.deallocate(resting_order);
             }
 
             // Move best ask forward if level fully depleted
@@ -64,7 +64,7 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
             if (resting_order->qty == 0) {
                 level->remove_order(resting_order);
                 order_map.erase(resting_order->id);
-                delete resting_order;
+                order_pool.deallocate(resting_order);
             }
 
             if (level->order_count == 0 && best_bid_price > 0) {
@@ -75,7 +75,7 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
 
     // 2. RESTING ORDER: If order quantity remains, place rest on book
     if (qty > 0) {
-        Order* new_order = new Order{id, price, qty, is_buy};
+        Order* new_order = order_pool.allocate(id, price, qty, is_buy);
         order_map[id] = new_order;
 
         if (is_buy) {
@@ -122,5 +122,5 @@ void OrderBook::cancel_order(uint64_t id) {
     }
 
     order_map.erase(it);
-    delete order;
+    order_pool.deallocate(order);
 }

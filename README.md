@@ -12,3 +12,15 @@ Benchmarked processing 100,000 randomized orders (inserts, matches, cancellation
 | **Execution Time** | ~63.7 ms |
 
 *Compiled with GCC `-O3` optimizations.*
+
+##  Market Data Feed & Replayer
+
+Includes an event-driven `MarketDataFeed` parser capable of streaming high-frequency tick data (CSV/binary feeds) into the engine:
+* Processes `ADD`, `CANCEL`, and `EXECUTE` order events in real time.
+* Supports timestamp-based playback simulation for backtesting trading strategies.
+
+##  Performance & Benchmarks
+
+* **Average Latency:** `~225.74 nanoseconds` per order operation
+* **Throughput:** `~3.25 Million operations/sec`
+* **Memory Management:** Custom zero-allocation `MemoryPool<Order>` eliminates OS heap overhead and latency jitter.

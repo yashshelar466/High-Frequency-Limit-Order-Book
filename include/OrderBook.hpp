@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 #include <iostream>
+#include "MemoryPool.hpp"
 
 // 1. The Core Order Data Structure
 struct Order {
@@ -15,6 +16,8 @@ struct Order {
     // Intrusive pointers for O(1) doubly-linked list insertion and removal
     Order* next = nullptr;
     Order* prev = nullptr;
+    Order(uint64_t i = 0, uint32_t p = 0, uint32_t q = 0, bool b = false)
+        : id(i), price(p), qty(q), is_buy(b), next(nullptr), prev(nullptr) {}
 };
 
 // 2. The Price Level Data Structure
@@ -84,4 +87,6 @@ public:
     // Getters for current top-of-book (Spread)
     uint32_t get_best_bid() const { return best_bid_price; }
     uint32_t get_best_ask() const { return best_ask_price; }
+    private:
+    MemoryPool<Order> order_pool;
 };
