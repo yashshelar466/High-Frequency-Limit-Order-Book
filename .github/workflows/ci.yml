@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tests
+        run: g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests
+
+      - name: Run tests
+        run: ./run_tests
+
+      - name: Build benchmark
+        run: g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark
+
+      - name: Build replayer
+        run: g++ -std=c++17 -Iinclude src/OrderBook.cpp src/replay_main.cpp -o run_feed
