@@ -99,6 +99,18 @@ public:
     void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy);
     void cancel_order(uint64_t id);
 
+    // Amend (cancel-replace) a resting order. Semantics follow exchange
+    // convention on time priority:
+    //   - Reducing quantity at the same price is done in place and KEEPS the
+    //     order's position in the FIFO queue.
+    //   - Changing price, or increasing quantity, LOSES priority: the order is
+    //     cancelled and re-submitted as a fresh aggressor, so it may cross the
+    //     book and execute immediately (emitting trades) before any remainder
+    //     rests at the back of the new level.
+    // A no-op (unknown id, new_qty == 0, or out-of-range price) leaves the book
+    // unchanged. The order keeps its original side.
+    void amend_order(uint64_t id, uint32_t new_price, uint32_t new_qty);
+
     // Trade/execution reporting. Register a handler to observe every fill the
     // matching engine produces — the foundation for backtesting (trade blotter,
     // PnL, VWAP) and for reconciling against an exchange's own execution feed.

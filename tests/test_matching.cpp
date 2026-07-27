@@ -261,6 +261,100 @@ void test_no_trades_for_resting_order() {
     std::cout << "[PASS] No Trades For Resting Orders Test" << std::endl;
 }
 
+void test_amend_qty_decrease_keeps_priority() {
+    OrderBook book;
+
+    // Three resting asks at the same price, in FIFO order.
+    book.insert_order(1, 105, 50, false);
+    book.insert_order(2, 105, 30, false);
+    book.insert_order(3, 105, 20, false);
+
+    // Reduce the head order's size. It must stay at the head (priority kept)
+    // and the level volume must drop by the reduction.
+    book.amend_order(1, 105, 10);
+
+    const PriceLevel* lvl = book.get_ask_level(105);
+    assert(lvl != nullptr && lvl->order_count == 3);
+    assert(lvl->total_volume == 60);  // 10 + 30 + 20
+    assert(lvl->head->id == 1 && lvl->head->qty == 10);
+    assert(lvl->head->next->id == 2);
+    assert(lvl->head->next->next->id == 3);
+
+    std::cout << "[PASS] Amend Qty-Decrease Keeps Priority Test" << std::endl;
+}
+
+void test_amend_price_change_requeues() {
+    OrderBook book;
+
+    book.insert_order(1, 105, 50, false);
+    book.insert_order(2, 106, 30, false);
+
+    // Move order 1 up to 106; it loses priority and joins the back of 106.
+    book.amend_order(1, 106, 50);
+
+    assert(book.get_ask_level(105) == nullptr);  // vacated
+    const PriceLevel* lvl = book.get_ask_level(106);
+    assert(lvl != nullptr && lvl->order_count == 2 && lvl->total_volume == 80);
+    // Order 2 was already resting, so it sits ahead of the re-queued order 1.
+    assert(lvl->head->id == 2);
+    assert(lvl->head->next->id == 1);
+
+    std::cout << "[PASS] Amend Price Change Re-queues Test" << std::endl;
+}
+
+void test_amend_qty_increase_loses_priority() {
+    OrderBook book;
+
+    book.insert_order(1, 105, 20, false);
+    book.insert_order(2, 105, 30, false);
+
+    // Increasing size at the same price loses priority: order 1 goes to the back.
+    book.amend_order(1, 105, 40);
+
+    const PriceLevel* lvl = book.get_ask_level(105);
+    assert(lvl != nullptr && lvl->order_count == 2 && lvl->total_volume == 70);
+    assert(lvl->head->id == 2);          // order 2 now has priority
+    assert(lvl->head->next->id == 1 && lvl->head->next->qty == 40);
+
+    std::cout << "[PASS] Amend Qty-Increase Loses Priority Test" << std::endl;
+}
+
+void test_amend_into_cross_executes() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    book.insert_order(1, 105, 40, false);   // resting ask
+    book.insert_order(2, 100, 40, true);    // resting bid, no cross
+
+    // Re-price the bid up to 105: it now crosses the ask and executes.
+    book.amend_order(2, 105, 40);
+
+    assert(trades.size() == 1);
+    assert(trades[0].taker_id == 2 && trades[0].maker_id == 1);
+    assert(trades[0].price == 105 && trades[0].qty == 40);
+    assert(book.get_ask_level(105) == nullptr);   // ask fully consumed
+    assert(book.get_best_ask() == 0xFFFFFFFF);
+    assert(book.get_bid_level(100) == nullptr);   // original bid vacated
+
+    std::cout << "[PASS] Amend Into Cross Executes Test" << std::endl;
+}
+
+void test_amend_unknown_and_invalid_noop() {
+    OrderBook book;
+    book.insert_order(1, 105, 40, false);
+
+    book.amend_order(999, 105, 10);  // unknown id
+    book.amend_order(1, 105, 0);     // zero qty
+    book.amend_order(1, 1000000, 10);// out-of-range price
+
+    const PriceLevel* lvl = book.get_ask_level(105);
+    assert(lvl != nullptr && lvl->order_count == 1 && lvl->total_volume == 40);
+    assert(lvl->head->id == 1 && lvl->head->qty == 40);
+
+    std::cout << "[PASS] Amend Unknown/Invalid No-op Test" << std::endl;
+}
+
 int main() {
     std::cout << "--- Running Expanded Unit Tests ---" << std::endl;
     test_partial_fill();
@@ -277,6 +371,11 @@ int main() {
     test_trade_reporting_multi_maker_sweep();
     test_trade_reporting_sell_aggressor();
     test_no_trades_for_resting_order();
+    test_amend_qty_decrease_keeps_priority();
+    test_amend_price_change_requeues();
+    test_amend_qty_increase_loses_priority();
+    test_amend_into_cross_executes();
+    test_amend_unknown_and_invalid_noop();
     std::cout << "--- All Tests Passed Successfully! ---" << std::endl;
     return 0;
 }

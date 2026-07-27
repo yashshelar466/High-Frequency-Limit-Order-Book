@@ -153,3 +153,28 @@ void OrderBook::cancel_order(uint64_t id) {
     order_map.erase(it);
     order_pool.deallocate(order);
 }
+
+void OrderBook::amend_order(uint64_t id, uint32_t new_price, uint32_t new_qty) {
+    auto it = order_map.find(id);
+    if (it == order_map.end()) return;                       // unknown order
+    if (new_qty == 0 || new_price >= MAX_PRICE_LEVELS) return;  // invalid: leave as-is
+
+    Order* order = it->second;
+    bool is_buy = order->is_buy;
+
+    // Reducing (or holding) quantity at the same price is done in place, which
+    // preserves the order's spot in the FIFO queue (time priority).
+    if (new_price == order->price && new_qty <= order->qty) {
+        uint32_t delta = order->qty - new_qty;
+        PriceLevel* level = is_buy ? bids[order->price] : asks[order->price];
+        if (level) level->total_volume -= delta;             // keep bookkeeping in sync
+        order->qty = new_qty;
+        return;
+    }
+
+    // Any price change or size increase loses priority: cancel and re-submit as
+    // a fresh aggressor. The re-inserted order may cross the book and execute
+    // immediately (emitting trades) before any remainder rests at the back.
+    cancel_order(id);
+    insert_order(id, new_price, new_qty, is_buy);
+}
