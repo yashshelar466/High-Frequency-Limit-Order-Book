@@ -92,6 +92,25 @@ public:
         live.erase(it);
     }
 
+    void amend_order(uint64_t id, uint32_t new_price, uint32_t new_qty) {
+        auto it = live.find(id);
+        if (it == live.end()) return;
+        if (new_qty == 0 || new_price >= MAX_PRICE_LEVELS) return;
+        uint32_t price = it->second.first;
+        bool is_buy = it->second.second;
+
+        // In-place reduction at the same price keeps the FIFO position.
+        Entry* e = find_entry(is_buy, price, id);
+        if (new_price == price && e != nullptr && new_qty <= e->qty) {
+            e->qty = new_qty;
+            return;
+        }
+
+        // Otherwise cancel-replace: re-enter as a fresh aggressor.
+        cancel_order(id);
+        insert_order(id, new_price, new_qty, is_buy);
+    }
+
     uint32_t best_bid() const { return bids.empty() ? EMPTY_BID : bids.begin()->first; }
     uint32_t best_ask() const { return asks.empty() ? EMPTY_ASK : asks.begin()->first; }
 
@@ -113,6 +132,21 @@ private:
                 fifo.pop_front();
             }
         }
+    }
+
+    // Locate a resting order by id within its price level (linear scan — the
+    // reference trades speed for clarity). Returns nullptr if absent.
+    Entry* find_entry(bool is_buy, uint32_t price, uint64_t id) {
+        if (is_buy) {
+            auto lvl = bids.find(price);
+            if (lvl == bids.end()) return nullptr;
+            for (auto& e : lvl->second) if (e.id == id) return &e;
+        } else {
+            auto lvl = asks.find(price);
+            if (lvl == asks.end()) return nullptr;
+            for (auto& e : lvl->second) if (e.id == id) return &e;
+        }
+        return nullptr;
     }
 
     template <typename Map>
@@ -242,12 +276,21 @@ int main() {
         fast_trades.clear();
         ref.trades.clear();
 
-        if (roll < 25 && !used_ids.empty()) {
+        if (roll < 20 && !used_ids.empty()) {
             // Cancel a previously-seen id (may already be filled/cancelled — the
             // no-op path is worth exercising and both books must agree on it).
             uint64_t id = used_ids[rng() % used_ids.size()];
             fast.cancel_order(id);
             ref.cancel_order(id);
+        } else if (roll < 35 && !used_ids.empty()) {
+            // Amend a previously-seen id to a random new price/qty, exercising
+            // both the in-place-reduction and cancel-replace (possibly crossing)
+            // paths.
+            uint64_t id = used_ids[rng() % used_ids.size()];
+            uint32_t new_price = price_dist(rng);
+            uint32_t new_qty = qty_dist(rng);
+            fast.amend_order(id, new_price, new_qty);
+            ref.amend_order(id, new_price, new_qty);
         } else {
             // Insert. 10% of inserts deliberately reuse a live-ish id to probe
             // duplicate-ID handling; the rest use a fresh monotonic id.
