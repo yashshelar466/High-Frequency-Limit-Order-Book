@@ -78,6 +78,16 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
         }
     }
 
+    // The matching loop only moves best_bid/best_ask as a bound while sweeping,
+    // so it can exit parked on an emptied level or a price gap. Restore the
+    // exact top-of-book (or empty-side sentinel) before anyone reads it or the
+    // resting-insert comparison below relies on it.
+    if (is_buy) {
+        normalize_best_ask();
+    } else {
+        normalize_best_bid();
+    }
+
     // 2. RESTING ORDER: If order quantity remains, place rest on book
     if (qty > 0) {
         Order* new_order = order_pool.allocate(id, price, qty, is_buy);
