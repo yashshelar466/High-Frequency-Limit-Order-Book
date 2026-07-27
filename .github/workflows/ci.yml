@@ -12,29 +12,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build unit tests
-        run: g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests
+      - name: Configure (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-      - name: Run unit tests
-        run: ./run_tests
+      - name: Build
+        run: cmake --build build -j
 
-      - name: Build differential test
-        run: g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
 
-      - name: Run differential test
-        run: ./run_diff
+      - name: Configure & build with ASan/UBSan
+        run: cmake -S . -B build-san -DENABLE_SANITIZERS=ON && cmake --build build-san -j
 
-      - name: Build & run test suites under ASan/UBSan
-        run: |
-          g++ -std=c++17 -fsanitize=address,undefined -fno-sanitize-recover=all -g \
-            -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests_san
-          ./run_tests_san
-          g++ -std=c++17 -fsanitize=address,undefined -fno-sanitize-recover=all -g \
-            -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff_san
-          ./run_diff_san
-
-      - name: Build benchmark
-        run: g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark
-
-      - name: Build replayer
-        run: g++ -std=c++17 -Iinclude src/OrderBook.cpp src/replay_main.cpp -o run_feed
+      - name: Test under ASan/UBSan
+        run: ctest --test-dir build-san --output-on-failure

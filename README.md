@@ -21,7 +21,7 @@ A single-threaded limit order book matching engine built in C++17, designed for 
 
 ## Overview
 
-This project implements the core matching logic used in real exchange systems: orders are matched by **price priority**, then **time priority** (FIFO within a price level). The engine is single-threaded by design — this removes lock contention and makes execution fully deterministic, which matters for reproducible backtesting and for reasoning precisely about worst-case latency.
+This project implements the core matching logic used in real exchange systems: orders are matched by **price priority**, then **time priority** (FIFO within a price level). It supports the standard order operations — **insert**, **cancel**, and **amend/cancel-replace** (an in-place quantity reduction keeps queue priority; a price change or size increase re-enters the order as a fresh aggressor). The engine is single-threaded by design — this removes lock contention and makes execution fully deterministic, which matters for reproducible backtesting and for reasoning precisely about worst-case latency.
 
 ## Performance
 
@@ -122,7 +122,7 @@ Trades execute at the resting maker's price (price-time priority), so a single c
 Two layers of tests guard the matching engine:
 
 - **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, and top-of-book reset after a level is emptied.
-- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random ADD / CANCEL / duplicate-ID / crossing operations at both the production engine and a deliberately simple `std::map`-based reference model, asserting they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
+- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random ADD / CANCEL / AMEND / duplicate-ID / crossing operations at both the production engine and a deliberately simple `std::map`-based reference model, asserting they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
 
 CI additionally rebuilds and runs both suites under AddressSanitizer + UndefinedBehaviorSanitizer, since the hot path mixes a custom memory pool with raw allocation.
 
@@ -152,30 +152,46 @@ Limit-Order-Book/
 
 ### Prerequisites
 - C++17-compatible compiler (g++ or Clang)
+- CMake 3.14+
 - Git
 
-### Build & Run
+### Build & Run (CMake)
 
 ```bash
 # Clone the repository
 git clone https://github.com/yashshelar466/High-Frequency-Limit-Order-Book.git
 cd High-Frequency-Limit-Order-Book
 
-# Run unit tests
-g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests
-./run_tests
+# Configure and build everything (Release)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 
-# Run randomized differential test (fast engine vs. simple reference model)
-g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff
-./run_diff
+# Run the test suites (unit + randomized differential) via CTest
+ctest --test-dir build --output-on-failure
 
-# Run latency & throughput benchmark
-g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark
-./run_benchmark
+# Run the individual binaries
+./build/run_benchmark    # latency & throughput benchmark
+./build/run_feed         # market data feed replayer (reads data/ticks.csv)
+./build/demo             # minimal usage example
+```
 
-# Run market data feed replayer
-g++ -std=c++17 -Iinclude src/OrderBook.cpp src/replay_main.cpp -o run_feed
-./run_feed
+To build and test with sanitizers (as CI does):
+
+```bash
+cmake -S . -B build-san -DENABLE_SANITIZERS=ON
+cmake --build build-san -j
+ctest --test-dir build-san --output-on-failure
+```
+
+### Build & Run (direct g++)
+
+No CMake? Each target is a single translation unit plus `src/OrderBook.cpp`:
+
+```bash
+g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests && ./run_tests
+g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff && ./run_diff
+g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark && ./run_benchmark
+g++ -std=c++17 -Iinclude src/OrderBook.cpp src/replay_main.cpp -o run_feed && ./run_feed
 ```
 
 ## License
