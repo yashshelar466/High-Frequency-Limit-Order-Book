@@ -13,6 +13,8 @@ A single-threaded limit order book matching engine built in C++17, designed for 
 - [Performance](#performance)
 - [Design & Architecture](#design--architecture)
 - [Key Optimizations](#key-optimizations)
+- [Trade & Execution Reporting](#trade--execution-reporting)
+- [Testing](#testing)
 - [Market Data Feed & Replayer](#market-data-feed--replayer)
 - [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
@@ -97,6 +99,33 @@ Each price level is an intrusive doubly-linked list, so cancellation is O(1) (un
 
 **O(1) price-time matching.** Intrusive doubly-linked lists per price level, combined with direct array indexing into price levels, keep both order placement and cancellation constant-time regardless of book depth.
 
+## Trade & Execution Reporting
+
+Matching is only half the story — a backtester needs to *observe* the fills the engine produces. Register a trade handler and the engine invokes it synchronously for every fill, in execution order:
+
+```cpp
+OrderBook book;
+book.set_trade_handler([](const Trade& t) {
+    // taker_id  – aggressing (incoming) order
+    // maker_id  – resting order that was hit
+    // price     – execution price (the resting maker's price)
+    // qty       – quantity filled
+    // taker_is_buy – side of the aggressor
+    std::cout << t.qty << " @ " << t.price << '\n';
+});
+```
+
+Trades execute at the resting maker's price (price-time priority), so a single crossing insert can emit several `Trade`s — one per resting order it consumes. This is the hook for a trade blotter, PnL/VWAP, or reconciling against an exchange's own execution feed. When no handler is set, the hot path pays only a single null check per fill. The replayer (`src/replay_main.cpp`) uses it to print a blotter and compute VWAP over a tick file.
+
+## Testing
+
+Two layers of tests guard the matching engine:
+
+- **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, and top-of-book reset after a level is emptied.
+- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random ADD / CANCEL / duplicate-ID / crossing operations at both the production engine and a deliberately simple `std::map`-based reference model, asserting they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
+
+CI additionally rebuilds and runs both suites under AddressSanitizer + UndefinedBehaviorSanitizer, since the hot path mixes a custom memory pool with raw allocation.
+
 ## Market Data Feed & Replayer
 
 An event-driven `MarketDataFeed` parser streams tick data into the engine:
@@ -112,7 +141,8 @@ Limit-Order-Book/
 │   ├── OrderBook.cpp      # Core matching engine
 │   └── replay_main.cpp    # Market data replayer entry point
 ├── tests/
-│   └── test_matching.cpp  # Unit tests for matching logic
+│   ├── test_matching.cpp     # Unit tests for matching logic
+│   └── test_differential.cpp # Randomized differential test vs. reference model
 ├── benchmarks/
 │   └── benchmark_latency.cpp
 └── README.md
@@ -134,6 +164,10 @@ cd High-Frequency-Limit-Order-Book
 # Run unit tests
 g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests
 ./run_tests
+
+# Run randomized differential test (fast engine vs. simple reference model)
+g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff
+./run_diff
 
 # Run latency & throughput benchmark
 g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark
