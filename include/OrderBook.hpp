@@ -99,5 +99,25 @@ public:
     }
 
     private:
+    // Re-establish the top-of-book invariant after a matching sweep may have
+    // depleted one or more levels: best_ask_price must point at the lowest
+    // live ask (best_bid_price at the highest live bid), or the empty-side
+    // sentinel when that side of the book holds no orders. The matching loop
+    // only advances these as a lower/upper bound, so it can leave them parked
+    // on an empty slot or a price gap — these normalize that.
+    void normalize_best_ask() {
+        while (best_ask_price < MAX_PRICE_LEVELS &&
+               (!asks[best_ask_price] || !asks[best_ask_price]->head)) {
+            best_ask_price++;
+        }
+        if (best_ask_price >= MAX_PRICE_LEVELS) best_ask_price = 0xFFFFFFFF;
+    }
+    void normalize_best_bid() {
+        while (best_bid_price > 0 &&
+               (!bids[best_bid_price] || !bids[best_bid_price]->head)) {
+            best_bid_price--;
+        }
+    }
+
     MemoryPool<Order> order_pool;
 };

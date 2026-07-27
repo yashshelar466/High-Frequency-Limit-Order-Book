@@ -96,6 +96,69 @@ void test_fifo_order_preserved_after_partial_fill() {
     std::cout << "[PASS] FIFO Order Preserved After Partial Fill Test" << std::endl;
 }
 
+void test_best_ask_resets_to_sentinel_after_full_sweep() {
+    OrderBook book;
+
+    // Only ask on the book, then a buy sweeps it completely.
+    book.insert_order(1, 105, 10, false);
+    book.insert_order(2, 105, 10, true);
+
+    // With no asks left, best ask must report the empty sentinel, not a
+    // stale price the sweep incremented past.
+    assert(book.get_best_ask() == 0xFFFFFFFF);
+    assert(book.get_ask_level(105) == nullptr);
+
+    std::cout << "[PASS] Best Ask Resets To Sentinel After Full Sweep Test" << std::endl;
+}
+
+void test_best_bid_resets_to_sentinel_after_full_sweep() {
+    OrderBook book;
+
+    // Only bid on the book, then a sell sweeps it completely.
+    book.insert_order(1, 100, 10, true);
+    book.insert_order(2, 100, 10, false);
+
+    // With no bids left, best bid must report the empty sentinel (0).
+    assert(book.get_best_bid() == 0);
+    assert(book.get_bid_level(100) == nullptr);
+
+    std::cout << "[PASS] Best Bid Resets To Sentinel After Full Sweep Test" << std::endl;
+}
+
+void test_best_ask_skips_gap_after_sweep() {
+    OrderBook book;
+
+    // Two asks with a price gap between them.
+    book.insert_order(1, 105, 10, false);
+    book.insert_order(2, 107, 10, false);
+    assert(book.get_best_ask() == 105);
+
+    // A buy at 106 can only fill the 105 level; the 107 level is out of reach.
+    book.insert_order(3, 106, 10, true);
+
+    // Best ask must now be the surviving 107 level, not the emptied 105 slot
+    // nor the 106 the sweep parked on.
+    assert(book.get_best_ask() == 107);
+    assert(book.get_ask_level(105) == nullptr);
+    assert(book.get_ask_level(107) != nullptr);
+
+    std::cout << "[PASS] Best Ask Skips Price Gap After Sweep Test" << std::endl;
+}
+
+void test_higher_ask_after_sweep_is_reported() {
+    OrderBook book;
+
+    // Sweep the book empty, then rest a NEW ask at a higher price than the
+    // one the sweep parked best_ask on. It must become the reported best ask.
+    book.insert_order(1, 105, 10, false);
+    book.insert_order(2, 105, 10, true);   // full sweep
+    book.insert_order(3, 108, 10, false);  // new resting ask, higher price
+
+    assert(book.get_best_ask() == 108);
+
+    std::cout << "[PASS] Higher Ask After Sweep Is Reported Test" << std::endl;
+}
+
 int main() {
     std::cout << "--- Running Expanded Unit Tests ---" << std::endl;
     test_partial_fill();
@@ -103,6 +166,10 @@ int main() {
     test_order_cancellation();
     test_invalid_inputs();
     test_fifo_order_preserved_after_partial_fill();
+    test_best_ask_resets_to_sentinel_after_full_sweep();
+    test_best_bid_resets_to_sentinel_after_full_sweep();
+    test_best_ask_skips_gap_after_sweep();
+    test_higher_ask_after_sweep_is_reported();
     std::cout << "--- All Tests Passed Successfully! ---" << std::endl;
     return 0;
 }
