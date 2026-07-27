@@ -1,6 +1,7 @@
 #include "../include/OrderBook.hpp"
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 void test_partial_fill() {
     OrderBook book;
@@ -182,6 +183,84 @@ void test_duplicate_order_id_rejected() {
     std::cout << "[PASS] Duplicate Order ID Rejected Test" << std::endl;
 }
 
+void test_trade_reporting_partial_fill() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    book.insert_order(1, 105, 100, false);   // resting ask, no fill yet
+    assert(trades.empty());
+
+    book.insert_order(2, 105, 40, true);     // buy 40 crosses -> one fill of 40
+
+    assert(trades.size() == 1);
+    const Trade& t = trades[0];
+    assert(t.taker_id == 2 && t.maker_id == 1);
+    assert(t.price == 105 && t.qty == 40);   // executes at the resting maker's price
+    assert(t.taker_is_buy == true);
+
+    std::cout << "[PASS] Trade Reporting Partial Fill Test" << std::endl;
+}
+
+void test_trade_reporting_multi_maker_sweep() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    // Two resting sells at the same price, plus one a tick higher.
+    book.insert_order(1, 105, 50, false);
+    book.insert_order(2, 105, 30, false);
+    book.insert_order(3, 106, 40, false);
+
+    // Aggressive buy for 100 @ 106: fills 50 (id1) + 30 (id2) at 105, then 20
+    // (id3) at 106, in price-time order. 20 of id3 remains resting.
+    book.insert_order(4, 106, 100, true);
+
+    assert(trades.size() == 3);
+    assert(trades[0].maker_id == 1 && trades[0].price == 105 && trades[0].qty == 50);
+    assert(trades[1].maker_id == 2 && trades[1].price == 105 && trades[1].qty == 30);
+    assert(trades[2].maker_id == 3 && trades[2].price == 106 && trades[2].qty == 20);
+    for (const auto& t : trades) {
+        assert(t.taker_id == 4 && t.taker_is_buy == true);
+    }
+
+    // Remainder of id3 rests; total filled equals the 100 the buyer wanted.
+    const PriceLevel* lvl = book.get_ask_level(106);
+    assert(lvl != nullptr && lvl->total_volume == 20);
+
+    std::cout << "[PASS] Trade Reporting Multi-Maker Sweep Test" << std::endl;
+}
+
+void test_trade_reporting_sell_aggressor() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    book.insert_order(1, 100, 60, true);     // resting bid
+    book.insert_order(2, 100, 25, false);    // sell 25 crosses -> fill of 25
+
+    assert(trades.size() == 1);
+    const Trade& t = trades[0];
+    assert(t.taker_id == 2 && t.maker_id == 1);
+    assert(t.price == 100 && t.qty == 25);
+    assert(t.taker_is_buy == false);
+
+    std::cout << "[PASS] Trade Reporting Sell Aggressor Test" << std::endl;
+}
+
+void test_no_trades_for_resting_order() {
+    OrderBook book;
+    int count = 0;
+    book.set_trade_handler([&](const Trade&) { ++count; });
+
+    book.insert_order(1, 105, 100, false);   // rests
+    book.insert_order(2, 100, 50, true);     // rests, no cross
+    book.cancel_order(1);
+
+    assert(count == 0);
+    std::cout << "[PASS] No Trades For Resting Orders Test" << std::endl;
+}
+
 int main() {
     std::cout << "--- Running Expanded Unit Tests ---" << std::endl;
     test_partial_fill();
@@ -194,6 +273,10 @@ int main() {
     test_best_ask_skips_gap_after_sweep();
     test_higher_ask_after_sweep_is_reported();
     test_duplicate_order_id_rejected();
+    test_trade_reporting_partial_fill();
+    test_trade_reporting_multi_maker_sweep();
+    test_trade_reporting_sell_aggressor();
+    test_no_trades_for_resting_order();
     std::cout << "--- All Tests Passed Successfully! ---" << std::endl;
     return 0;
 }

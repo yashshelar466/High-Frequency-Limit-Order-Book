@@ -40,6 +40,12 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
             resting_order->qty -= fill_qty;
             level->total_volume -= fill_qty;
 
+            // Report the fill (at the resting maker's price) before the resting
+            // order may be freed below.
+            if (trade_handler) {
+                trade_handler(Trade{id, resting_order->id, level->price, fill_qty, true});
+            }
+
             // If resting order is fully filled, remove it
             if (resting_order->qty == 0) {
                 level->remove_order(resting_order);
@@ -70,6 +76,12 @@ void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_
             qty -= fill_qty;
             resting_order->qty -= fill_qty;
             level->total_volume -= fill_qty;
+
+            // Report the fill (at the resting maker's price) before the resting
+            // order may be freed below. Aggressor here is a sell.
+            if (trade_handler) {
+                trade_handler(Trade{id, resting_order->id, level->price, fill_qty, false});
+            }
 
             if (resting_order->qty == 0) {
                 level->remove_order(resting_order);

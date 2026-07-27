@@ -45,6 +45,7 @@ public:
     std::map<uint32_t, Level, std::greater<uint32_t>> bids;  // highest first
     std::map<uint32_t, Level> asks;                          // lowest first
     std::unordered_map<uint64_t, std::pair<uint32_t, bool>> live;  // id -> (price, is_buy)
+    std::vector<Trade> trades;  // fills produced by the most recent operation
 
     void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy) {
         if (price >= MAX_PRICE_LEVELS || qty == 0) return;
@@ -53,8 +54,9 @@ public:
         if (is_buy) {
             // Cross against the lowest asks priced at or below our limit.
             while (qty > 0 && !asks.empty() && asks.begin()->first <= price) {
+                uint32_t lvl_price = asks.begin()->first;
                 Level& fifo = asks.begin()->second;
-                match_into(fifo, qty);
+                match_into(fifo, qty, id, lvl_price, true);
                 if (fifo.empty()) asks.erase(asks.begin());
             }
             if (qty > 0) {
@@ -64,8 +66,9 @@ public:
         } else {
             // Cross against the highest bids priced at or above our limit.
             while (qty > 0 && !bids.empty() && bids.begin()->first >= price) {
+                uint32_t lvl_price = bids.begin()->first;
                 Level& fifo = bids.begin()->second;
-                match_into(fifo, qty);
+                match_into(fifo, qty, id, lvl_price, false);
                 if (fifo.empty()) bids.erase(bids.begin());
             }
             if (qty > 0) {
@@ -97,12 +100,14 @@ private:
     // resting FIFO until either the aggressor is exhausted or the level empties.
     // A fully-filled resting order must leave `live` too, so its id becomes
     // reusable — exactly as the fast engine frees it from order_map.
-    void match_into(Level& fifo, uint32_t& qty) {
+    void match_into(Level& fifo, uint32_t& qty, uint64_t taker_id,
+                    uint32_t price, bool taker_is_buy) {
         while (qty > 0 && !fifo.empty()) {
             Entry& front = fifo.front();
             uint32_t fill = std::min(qty, front.qty);
             qty -= fill;
             front.qty -= fill;
+            trades.push_back(Trade{taker_id, front.id, price, fill, taker_is_buy});
             if (front.qty == 0) {
                 live.erase(front.id);
                 fifo.pop_front();
@@ -223,11 +228,19 @@ int main() {
     std::vector<uint64_t> used_ids;  // for cancel targeting + duplicate-ID attempts
     uint64_t next_id = 1;
 
+    // Capture the fast engine's fills for the current op so they can be
+    // compared against the reference model's fills op-for-op.
+    std::vector<Trade> fast_trades;
+    fast.set_trade_handler([&](const Trade& t) { fast_trades.push_back(t); });
+
     std::cout << "--- Running Differential Test (" << NUM_OPS
               << " ops vs reference model) ---" << std::endl;
 
     for (int i = 0; i < NUM_OPS; ++i) {
         int roll = op_dist(rng);
+
+        fast_trades.clear();
+        ref.trades.clear();
 
         if (roll < 25 && !used_ids.empty()) {
             // Cancel a previously-seen id (may already be filled/cancelled — the
@@ -263,6 +276,28 @@ int main() {
             assert(false && "top-of-book divergence");
         }
 
+        // The trade stream this op produced must match the reference exactly,
+        // fill for fill, in order.
+        if (fast_trades.size() != ref.trades.size()) {
+            std::cerr << "TRADE COUNT mismatch at op " << i
+                      << " (fast=" << fast_trades.size()
+                      << " ref=" << ref.trades.size() << ")" << std::endl;
+            assert(false && "trade count divergence");
+        }
+        for (size_t k = 0; k < fast_trades.size(); ++k) {
+            const Trade& a = fast_trades[k];
+            const Trade& b = ref.trades[k];
+            if (a.taker_id != b.taker_id || a.maker_id != b.maker_id ||
+                a.price != b.price || a.qty != b.qty || a.taker_is_buy != b.taker_is_buy) {
+                std::cerr << "TRADE mismatch at op " << i << " fill " << k
+                          << " (fast taker=" << a.taker_id << " maker=" << a.maker_id
+                          << " px=" << a.price << " qty=" << a.qty
+                          << " | ref taker=" << b.taker_id << " maker=" << b.maker_id
+                          << " px=" << b.price << " qty=" << b.qty << ")" << std::endl;
+                assert(false && "trade divergence");
+            }
+        }
+
         // Expensive full-state comparison periodically.
         if ((i + 1) % FULL_COMPARE_EVERY == 0) {
             std::string err;
@@ -281,6 +316,7 @@ int main() {
     }
 
     std::cout << "[PASS] Differential test: " << NUM_OPS
-              << " ops matched the reference model exactly." << std::endl;
+              << " ops matched the reference model exactly (book state + trade stream)."
+              << std::endl;
     return 0;
 }

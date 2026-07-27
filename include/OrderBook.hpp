@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 #include <iostream>
+#include <functional>
 #include "MemoryPool.hpp"
 
 // 1. The Core Order Data Structure
@@ -57,7 +58,21 @@ struct PriceLevel {
     }
 };
 
-// 3. The OrderBook Class Interface
+// 3. A single execution (fill) produced by the matching engine.
+//
+// Every fill pairs an incoming aggressor with one resting maker. Trades
+// execute at the resting order's price (price-time priority), so `price` is
+// the maker's limit price, not the aggressor's. A single crossing insert can
+// produce several Trades — one per resting order it consumes.
+struct Trade {
+    uint64_t taker_id;    // aggressing (incoming) order
+    uint64_t maker_id;    // resting (passive) order that was hit
+    uint32_t price;       // execution price (the resting maker's price)
+    uint32_t qty;         // quantity filled
+    bool taker_is_buy;    // side of the aggressor
+};
+
+// 4. The OrderBook Class Interface
 class OrderBook {
 private:
     // Fixed array for direct O(1) price-level lookup (e.g., tick index)
@@ -83,6 +98,15 @@ public:
     // Core Matching Engine Methods
     void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy);
     void cancel_order(uint64_t id);
+
+    // Trade/execution reporting. Register a handler to observe every fill the
+    // matching engine produces — the foundation for backtesting (trade blotter,
+    // PnL, VWAP) and for reconciling against an exchange's own execution feed.
+    // The handler is invoked synchronously from within insert_order, once per
+    // fill, in execution order. Leaving it unset keeps the hot path free of any
+    // reporting overhead (a single null check per fill).
+    using TradeHandler = std::function<void(const Trade&)>;
+    void set_trade_handler(TradeHandler handler) { trade_handler = std::move(handler); }
 
     // Getters for current top-of-book (Spread)
     uint32_t get_best_bid() const { return best_bid_price; }
@@ -120,4 +144,5 @@ public:
     }
 
     MemoryPool<Order> order_pool;
+    TradeHandler trade_handler;
 };
