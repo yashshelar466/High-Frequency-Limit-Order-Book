@@ -15,6 +15,13 @@ OrderBook::~OrderBook() {
 void OrderBook::insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy) {
     if (price >= MAX_PRICE_LEVELS || qty == 0) return;
 
+    // Reject a duplicate live order ID. Overwriting order_map[id] would orphan
+    // the existing order: it stays linked in its price level (still counting
+    // toward book volume) but becomes unreachable for cancellation and leaks at
+    // shutdown, since the destructor only frees orders reachable via order_map.
+    // Exchanges reject duplicate client order IDs outright, so mirror that.
+    if (order_map.find(id) != order_map.end()) return;
+
     // 1. MATCHING LOOP: Try to execute against resting opposite orders first
     if (is_buy) {
         while (qty > 0 && best_ask_price <= price) {
@@ -117,22 +124,17 @@ void OrderBook::cancel_order(uint64_t id) {
         if (!bids[price]->head) {
             delete bids[price];
             bids[price] = nullptr;
-            if (best_bid_price == price) {
-                while (best_bid_price > 0 && (!bids[best_bid_price] || !bids[best_bid_price]->head)) {
-                    best_bid_price--;
-                }
-            }
+            // If we just removed the top-of-book level, re-establish the
+            // best-price invariant (also resets to the empty sentinel when the
+            // side is now empty) via the shared normalizer.
+            if (best_bid_price == price) normalize_best_bid();
         }
     } else if (!order->is_buy && asks[price]) {
         asks[price]->remove_order(order);
         if (!asks[price]->head) {
             delete asks[price];
             asks[price] = nullptr;
-            if (best_ask_price == price) {
-                while (best_ask_price < MAX_PRICE_LEVELS && (!asks[best_ask_price] || !asks[best_ask_price]->head)) {
-                    best_ask_price++;
-                }
-            }
+            if (best_ask_price == price) normalize_best_ask();
         }
     }
 

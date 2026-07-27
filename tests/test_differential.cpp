@@ -1,0 +1,286 @@
+// Randomized differential test.
+//
+// Fires a long stream of random ADD / CANCEL / duplicate-ID / crossing
+// operations at both the production OrderBook and a deliberately simple,
+// obviously-correct reference model built on std::map, then asserts the two
+// agree on top-of-book AND full per-level FIFO/volume state.
+//
+// The reference trades all of the production engine's performance tricks
+// (fixed price arrays, intrusive lists, memory pool, incremental best-price
+// tracking) for clarity, so any divergence points at a bug in the fast path.
+// This is the kind of property/differential test that catches entire classes
+// of matching-engine bugs — including stale best-price tracking and duplicate
+// order-ID handling — that hand-written example tests tend to miss.
+
+#include "../include/OrderBook.hpp"
+
+#include <cassert>
+#include <cstdint>
+#include <iostream>
+#include <list>
+#include <map>
+#include <random>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+constexpr uint32_t MAX_PRICE_LEVELS = 100000;  // must match OrderBook
+constexpr uint32_t EMPTY_ASK = 0xFFFFFFFF;     // OrderBook's empty-ask sentinel
+constexpr uint32_t EMPTY_BID = 0;              // OrderBook's empty-bid sentinel
+
+// A straightforward, allocation-happy order book used purely as an oracle.
+// Bids are keyed descending so begin() is the best (highest) bid; asks ascending
+// so begin() is the best (lowest) ask. Each price maps to a FIFO of resting
+// orders, exactly mirroring price-time priority.
+class ReferenceBook {
+public:
+    struct Entry {
+        uint64_t id;
+        uint32_t qty;
+    };
+    using Level = std::list<Entry>;
+
+    std::map<uint32_t, Level, std::greater<uint32_t>> bids;  // highest first
+    std::map<uint32_t, Level> asks;                          // lowest first
+    std::unordered_map<uint64_t, std::pair<uint32_t, bool>> live;  // id -> (price, is_buy)
+
+    void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy) {
+        if (price >= MAX_PRICE_LEVELS || qty == 0) return;
+        if (live.count(id)) return;  // duplicate live ID rejected
+
+        if (is_buy) {
+            // Cross against the lowest asks priced at or below our limit.
+            while (qty > 0 && !asks.empty() && asks.begin()->first <= price) {
+                Level& fifo = asks.begin()->second;
+                match_into(fifo, qty);
+                if (fifo.empty()) asks.erase(asks.begin());
+            }
+            if (qty > 0) {
+                bids[price].push_back({id, qty});
+                live[id] = {price, true};
+            }
+        } else {
+            // Cross against the highest bids priced at or above our limit.
+            while (qty > 0 && !bids.empty() && bids.begin()->first >= price) {
+                Level& fifo = bids.begin()->second;
+                match_into(fifo, qty);
+                if (fifo.empty()) bids.erase(bids.begin());
+            }
+            if (qty > 0) {
+                asks[price].push_back({id, qty});
+                live[id] = {price, false};
+            }
+        }
+    }
+
+    void cancel_order(uint64_t id) {
+        auto it = live.find(id);
+        if (it == live.end()) return;
+        uint32_t price = it->second.first;
+        bool is_buy = it->second.second;
+
+        if (is_buy) {
+            erase_from_level(bids, price, id);
+        } else {
+            erase_from_level(asks, price, id);
+        }
+        live.erase(it);
+    }
+
+    uint32_t best_bid() const { return bids.empty() ? EMPTY_BID : bids.begin()->first; }
+    uint32_t best_ask() const { return asks.empty() ? EMPTY_ASK : asks.begin()->first; }
+
+private:
+    // Fill an incoming aggressor (remaining size `qty`) against the front of a
+    // resting FIFO until either the aggressor is exhausted or the level empties.
+    // A fully-filled resting order must leave `live` too, so its id becomes
+    // reusable — exactly as the fast engine frees it from order_map.
+    void match_into(Level& fifo, uint32_t& qty) {
+        while (qty > 0 && !fifo.empty()) {
+            Entry& front = fifo.front();
+            uint32_t fill = std::min(qty, front.qty);
+            qty -= fill;
+            front.qty -= fill;
+            if (front.qty == 0) {
+                live.erase(front.id);
+                fifo.pop_front();
+            }
+        }
+    }
+
+    template <typename Map>
+    static void erase_from_level(Map& side, uint32_t price, uint64_t id) {
+        auto lvl = side.find(price);
+        if (lvl == side.end()) return;
+        Level& fifo = lvl->second;
+        for (auto e = fifo.begin(); e != fifo.end(); ++e) {
+            if (e->id == id) {
+                fifo.erase(e);
+                break;
+            }
+        }
+        if (fifo.empty()) side.erase(lvl);
+    }
+};
+
+// Compare a single side's price level between the fast engine and the oracle:
+// existence, order count, aggregate volume, and the exact FIFO id/qty sequence.
+bool level_matches(const PriceLevel* fast, const ReferenceBook::Level* ref,
+                   uint32_t price, const char* side, std::string& err) {
+    bool fast_live = (fast != nullptr && fast->head != nullptr);
+    bool ref_live = (ref != nullptr && !ref->empty());
+
+    if (fast_live != ref_live) {
+        err = std::string(side) + " level " + std::to_string(price) +
+              " existence mismatch (fast=" + std::to_string(fast_live) +
+              " ref=" + std::to_string(ref_live) + ")";
+        return false;
+    }
+    if (!fast_live) return true;
+
+    if (fast->order_count != ref->size()) {
+        err = std::string(side) + " level " + std::to_string(price) +
+              " order_count mismatch (fast=" + std::to_string(fast->order_count) +
+              " ref=" + std::to_string(ref->size()) + ")";
+        return false;
+    }
+
+    uint64_t ref_vol = 0;
+    for (const auto& e : *ref) ref_vol += e.qty;
+    if (fast->total_volume != ref_vol) {
+        err = std::string(side) + " level " + std::to_string(price) +
+              " volume mismatch (fast=" + std::to_string(fast->total_volume) +
+              " ref=" + std::to_string(ref_vol) + ")";
+        return false;
+    }
+
+    const Order* o = fast->head;
+    auto it = ref->begin();
+    size_t pos = 0;
+    while (o != nullptr && it != ref->end()) {
+        if (o->id != it->id || o->qty != it->qty) {
+            err = std::string(side) + " level " + std::to_string(price) +
+                  " FIFO mismatch at pos " + std::to_string(pos) +
+                  " (fast id=" + std::to_string(o->id) + " qty=" + std::to_string(o->qty) +
+                  " vs ref id=" + std::to_string(it->id) + " qty=" + std::to_string(it->qty) + ")";
+            return false;
+        }
+        o = o->next;
+        ++it;
+        ++pos;
+    }
+    return true;
+}
+
+// Compare the entire active price band between the two books.
+bool full_compare(const OrderBook& fast, const ReferenceBook& ref,
+                  uint32_t pmin, uint32_t pmax, std::string& err) {
+    if (fast.get_best_bid() != ref.best_bid()) {
+        err = "best_bid mismatch (fast=" + std::to_string(fast.get_best_bid()) +
+              " ref=" + std::to_string(ref.best_bid()) + ")";
+        return false;
+    }
+    if (fast.get_best_ask() != ref.best_ask()) {
+        err = "best_ask mismatch (fast=" + std::to_string(fast.get_best_ask()) +
+              " ref=" + std::to_string(ref.best_ask()) + ")";
+        return false;
+    }
+
+    for (uint32_t p = pmin; p <= pmax; ++p) {
+        auto rb = ref.bids.find(p);
+        const ReferenceBook::Level* rbl = (rb == ref.bids.end()) ? nullptr : &rb->second;
+        if (!level_matches(fast.get_bid_level(p), rbl, p, "bid", err)) return false;
+
+        auto ra = ref.asks.find(p);
+        const ReferenceBook::Level* ral = (ra == ref.asks.end()) ? nullptr : &ra->second;
+        if (!level_matches(fast.get_ask_level(p), ral, p, "ask", err)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+int main() {
+    // Deterministic seed so a failure is exactly reproducible.
+    std::mt19937_64 rng(42);
+
+    // Narrow price band => frequent crossings and real book depth, and a cheap
+    // full-book comparison (only ~30 prices to scan).
+    constexpr uint32_t PMIN = 100;
+    constexpr uint32_t PMAX = 130;
+    constexpr int NUM_OPS = 300000;
+    constexpr int FULL_COMPARE_EVERY = 1000;
+
+    std::uniform_int_distribution<uint32_t> price_dist(PMIN, PMAX);
+    std::uniform_int_distribution<uint32_t> qty_dist(1, 50);
+    std::uniform_int_distribution<int> side_dist(0, 1);
+    std::uniform_int_distribution<int> op_dist(0, 99);
+
+    OrderBook fast;
+    ReferenceBook ref;
+    std::vector<uint64_t> used_ids;  // for cancel targeting + duplicate-ID attempts
+    uint64_t next_id = 1;
+
+    std::cout << "--- Running Differential Test (" << NUM_OPS
+              << " ops vs reference model) ---" << std::endl;
+
+    for (int i = 0; i < NUM_OPS; ++i) {
+        int roll = op_dist(rng);
+
+        if (roll < 25 && !used_ids.empty()) {
+            // Cancel a previously-seen id (may already be filled/cancelled — the
+            // no-op path is worth exercising and both books must agree on it).
+            uint64_t id = used_ids[rng() % used_ids.size()];
+            fast.cancel_order(id);
+            ref.cancel_order(id);
+        } else {
+            // Insert. 10% of inserts deliberately reuse a live-ish id to probe
+            // duplicate-ID handling; the rest use a fresh monotonic id.
+            uint64_t id;
+            if (roll >= 90 && !used_ids.empty()) {
+                id = used_ids[rng() % used_ids.size()];
+            } else {
+                id = next_id++;
+                used_ids.push_back(id);
+            }
+            uint32_t price = price_dist(rng);
+            uint32_t qty = qty_dist(rng);
+            bool is_buy = side_dist(rng) == 1;
+
+            fast.insert_order(id, price, qty, is_buy);
+            ref.insert_order(id, price, qty, is_buy);
+        }
+
+        // Cheap invariant checked on every single op.
+        if (fast.get_best_bid() != ref.best_bid() || fast.get_best_ask() != ref.best_ask()) {
+            std::cerr << "TOP-OF-BOOK mismatch at op " << i
+                      << " (fast bid=" << fast.get_best_bid()
+                      << " ask=" << fast.get_best_ask()
+                      << " | ref bid=" << ref.best_bid()
+                      << " ask=" << ref.best_ask() << ")" << std::endl;
+            assert(false && "top-of-book divergence");
+        }
+
+        // Expensive full-state comparison periodically.
+        if ((i + 1) % FULL_COMPARE_EVERY == 0) {
+            std::string err;
+            if (!full_compare(fast, ref, PMIN, PMAX, err)) {
+                std::cerr << "FULL-BOOK mismatch at op " << i << ": " << err << std::endl;
+                assert(false && "full-book divergence");
+            }
+        }
+    }
+
+    // Final exhaustive comparison.
+    std::string err;
+    if (!full_compare(fast, ref, PMIN, PMAX, err)) {
+        std::cerr << "FINAL full-book mismatch: " << err << std::endl;
+        assert(false && "final full-book divergence");
+    }
+
+    std::cout << "[PASS] Differential test: " << NUM_OPS
+              << " ops matched the reference model exactly." << std::endl;
+    return 0;
+}

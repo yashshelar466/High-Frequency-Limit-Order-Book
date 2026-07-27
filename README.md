@@ -97,6 +97,15 @@ Each price level is an intrusive doubly-linked list, so cancellation is O(1) (un
 
 **O(1) price-time matching.** Intrusive doubly-linked lists per price level, combined with direct array indexing into price levels, keep both order placement and cancellation constant-time regardless of book depth.
 
+## Testing
+
+Two layers of tests guard the matching engine:
+
+- **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, and top-of-book reset after a level is emptied.
+- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random ADD / CANCEL / duplicate-ID / crossing operations at both the production engine and a deliberately simple `std::map`-based reference model, asserting they agree on top-of-book on every operation and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling) that example-based tests tend to miss.
+
+CI additionally rebuilds and runs both suites under AddressSanitizer + UndefinedBehaviorSanitizer, since the hot path mixes a custom memory pool with raw allocation.
+
 ## Market Data Feed & Replayer
 
 An event-driven `MarketDataFeed` parser streams tick data into the engine:
@@ -112,7 +121,8 @@ Limit-Order-Book/
 │   ├── OrderBook.cpp      # Core matching engine
 │   └── replay_main.cpp    # Market data replayer entry point
 ├── tests/
-│   └── test_matching.cpp  # Unit tests for matching logic
+│   ├── test_matching.cpp     # Unit tests for matching logic
+│   └── test_differential.cpp # Randomized differential test vs. reference model
 ├── benchmarks/
 │   └── benchmark_latency.cpp
 └── README.md
@@ -134,6 +144,10 @@ cd High-Frequency-Limit-Order-Book
 # Run unit tests
 g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests
 ./run_tests
+
+# Run randomized differential test (fast engine vs. simple reference model)
+g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff
+./run_diff
 
 # Run latency & throughput benchmark
 g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark

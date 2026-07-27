@@ -159,6 +159,29 @@ void test_higher_ask_after_sweep_is_reported() {
     std::cout << "[PASS] Higher Ask After Sweep Is Reported Test" << std::endl;
 }
 
+void test_duplicate_order_id_rejected() {
+    OrderBook book;
+
+    // Resting ask under id 1.
+    book.insert_order(1, 105, 100, false);
+
+    // Re-using id 1 for a different resting ask must be rejected outright, not
+    // overwrite the map entry (which would orphan the original order).
+    book.insert_order(1, 106, 50, false);
+
+    // No level was created at 106, and the original @105 is untouched.
+    assert(book.get_ask_level(106) == nullptr);
+    const PriceLevel* lvl = book.get_ask_level(105);
+    assert(lvl != nullptr && lvl->order_count == 1 && lvl->total_volume == 100);
+
+    // The original order is still reachable for cancellation via id 1.
+    book.cancel_order(1);
+    assert(book.get_ask_level(105) == nullptr);
+    assert(book.get_best_ask() == 0xFFFFFFFF);
+
+    std::cout << "[PASS] Duplicate Order ID Rejected Test" << std::endl;
+}
+
 int main() {
     std::cout << "--- Running Expanded Unit Tests ---" << std::endl;
     test_partial_fill();
@@ -170,6 +193,7 @@ int main() {
     test_best_bid_resets_to_sentinel_after_full_sweep();
     test_best_ask_skips_gap_after_sweep();
     test_higher_ask_after_sweep_is_reported();
+    test_duplicate_order_id_rejected();
     std::cout << "--- All Tests Passed Successfully! ---" << std::endl;
     return 0;
 }
