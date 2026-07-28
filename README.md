@@ -54,7 +54,7 @@ p50 climbing from 200 ns at 21 levels to 400 ns at 20,000 is the `O(log L)` cost
 
 > The `max` is ~1000× the p99.9 — OS scheduler jitter (context switches, page faults), not the engine. The p99.9 column is the more representative worst case for the algorithm itself.
 
-**Test Environment:** Windows, <YOUR CPU>, <YOUR g++ VERSION> (MinGW-w64), `-O3`, `QueryPerformanceCounter` (~100 ns resolution).
+**Test Environment:** Windows 11, Intel Core i5-8365U @ 1.60GHz, GCC 6.3.0 (MinGW), `-O3`, `QueryPerformanceCounter` (~100 ns resolution).
 > Latency numbers are meaningless without hardware context — always report the machine a benchmark ran on.
 
 ## Design & Architecture
