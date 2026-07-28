@@ -35,26 +35,26 @@ Latency is measured with `-O3` and reported **across book depths**, since level 
 
 | Live price levels (L) | p50    | p99      |
 | --------------------- | ------ | -------- |
-| 21                    | 200 ns | 400 ns   |
-| 1,000                 | 200 ns | 500 ns   |
-| 20,000                | 400 ns | 1,000 ns |
+| 21                    | 200 ns | 2,100 ns |
+| 1,000                 | 300 ns | 2,400 ns |
+| 20,000                | 600 ns | 3,200 ns |
 
-p50 climbing from 200 ns at 21 levels to 400 ns at 20,000 is the `O(log L)` cost of the ordered-map lookup made visible (21 and 1,000 tie only because their ~6-comparison difference is under the 100 ns timer tick). The earlier fixed-array design was `O(1)` here — a deliberate trade for an uncapped price range and cheap L2 depth (see [Design & Architecture](#design--architecture)).
+p50 climbing from 200 ns at 21 levels to 300 ns at 1,000 to 600 ns at 20,000 is the `O(log L)` cost of the ordered-map lookup made directly visible; p99 shows the same trend (2,100 → 2,400 → 3,200 ns), the same design cost surfacing further out in the tail. The earlier fixed-array design was `O(1)` here — a deliberate trade for an uncapped price range and cheap L2 depth (see [Design & Architecture](#design--architecture)).
 
 **Cancels** (intrusive-list unlink at a random queue position; n = 80,000)
 
 | Percentile | Latency      |
 | ---------- | ------------ |
-| avg        | 546 ns       |
-| p50        | 400 ns       |
-| p90        | 600 ns       |
-| p99        | 900 ns       |
-| p99.9      | 2,300 ns     |
-| max        | 2,511,400 ns |
+| avg        | 619.046 ns   |
+| p50        | 600 ns       |
+| p90        | 700 ns       |
+| p99        | 1000 ns      |
+| p99.9      | 18,900 ns    |
+| max        | 126,400 ns   |
 
-> The `max` is ~1000× the p99.9 — OS scheduler jitter (context switches, page faults), not the engine. The p99.9 column is the more representative worst case for the algorithm itself.
+> The `max` is ~7× the p99.9 — OS scheduler jitter (context switches, page faults), not the engine. The p99.9 column is the more representative worst case for the algorithm itself.
 
-**Test Environment:** Windows 11, Intel Core i5-8365U @ 1.60GHz, GCC 6.3.0 (MinGW), `-O3`, `QueryPerformanceCounter` (~100 ns resolution).
+**Test Environment:** Windows 11, Intel Core i5-8365U @ 1.60GHz, GCC 16.1.0 (MinGW-w64), `-O3`, `QueryPerformanceCounter` (~100 ns resolution).
 > Latency numbers are meaningless without hardware context — always report the machine a benchmark ran on.
 
 ## Design & Architecture
