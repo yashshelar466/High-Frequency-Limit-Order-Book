@@ -163,7 +163,7 @@ An event-driven `MarketDataFeed` parser streams tick data into the engine:
 - Processes `ADD`, `CANCEL`, and `EXECUTE` events from CSV input
 - Supports timestamp-based playback for backtesting trading strategies against historical or synthetic tick data
 
-## Project Structure
+## Structure
 
 ```
 Limit-Order-Book/
