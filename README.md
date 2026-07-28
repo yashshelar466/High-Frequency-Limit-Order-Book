@@ -18,7 +18,7 @@ A single-threaded limit order book matching engine built in C++17, designed for 
 - [Trade & Execution Reporting](#trade--execution-reporting)
 - [Testing](#testing)
 - [Market Data Feed & Replayer](#market-data-feed--replayer)
-- [Project Structure](#project-structure)
+- [Structure](#structure)
 - [Quick Start](#quick-start)
 
 ## Overview
