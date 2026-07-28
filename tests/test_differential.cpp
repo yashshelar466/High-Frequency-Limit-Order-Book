@@ -14,7 +14,7 @@
 
 #include "../include/OrderBook.hpp"
 
-#include <cassert>
+#include "check.hpp"
 #include <cstdint>
 #include <iostream>
 #include <list>
@@ -359,7 +359,7 @@ int main() {
                       << " ask=" << fast.get_best_ask()
                       << " | ref bid=" << ref.best_bid()
                       << " ask=" << ref.best_ask() << ")" << std::endl;
-            assert(false && "top-of-book divergence");
+            CHECK(false && "top-of-book divergence");
         }
 
         // The trade stream this op produced must match the reference exactly,
@@ -368,7 +368,7 @@ int main() {
             std::cerr << "TRADE COUNT mismatch at op " << i
                       << " (fast=" << fast_trades.size()
                       << " ref=" << ref.trades.size() << ")" << std::endl;
-            assert(false && "trade count divergence");
+            CHECK(false && "trade count divergence");
         }
         for (size_t k = 0; k < fast_trades.size(); ++k) {
             const Trade& a = fast_trades[k];
@@ -380,7 +380,7 @@ int main() {
                           << " px=" << a.price << " qty=" << a.qty
                           << " | ref taker=" << b.taker_id << " maker=" << b.maker_id
                           << " px=" << b.price << " qty=" << b.qty << ")" << std::endl;
-                assert(false && "trade divergence");
+                CHECK(false && "trade divergence");
             }
         }
 
@@ -389,7 +389,7 @@ int main() {
             std::string err;
             if (!full_compare(fast, ref, PMIN, PMAX, err)) {
                 std::cerr << "FULL-BOOK mismatch at op " << i << ": " << err << std::endl;
-                assert(false && "full-book divergence");
+                CHECK(false && "full-book divergence");
             }
         }
     }
@@ -398,7 +398,7 @@ int main() {
     std::string err;
     if (!full_compare(fast, ref, PMIN, PMAX, err)) {
         std::cerr << "FINAL full-book mismatch: " << err << std::endl;
-        assert(false && "final full-book divergence");
+        CHECK(false && "final full-book divergence");
     }
 
     std::cout << "[PASS] Differential test: " << NUM_OPS

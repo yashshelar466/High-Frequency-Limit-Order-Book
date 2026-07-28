@@ -12,11 +12,6 @@
 
 namespace {
 
-// std::chrono::steady_clock on some MinGW/Windows builds does not reliably
-// resolve down to the sub-microsecond scale a single order insert takes
-// (~100-300ns) -- most measurements round down to 0. QueryPerformanceCounter
-// is the actual high-resolution timer on Windows and gives real nanosecond
-// granularity; on other platforms steady_clock is already reliable.
 struct HighResTimer {
 #ifdef _WIN32
     static double ticks_per_sec() {
@@ -39,94 +34,103 @@ struct HighResTimer {
 #endif
 };
 
-// Returns the value at the given percentile (0-100) of an already-sorted vector.
-int64_t percentile(const std::vector<int64_t>& sorted_latencies, double pct) {
-    if (sorted_latencies.empty()) return 0;
-    size_t idx = static_cast<size_t>(std::ceil(pct / 100.0 * sorted_latencies.size())) - 1;
-    idx = std::min(idx, sorted_latencies.size() - 1);
-    return sorted_latencies[idx];
+int64_t percentile(const std::vector<int64_t>& sorted, double pct) {
+    if (sorted.empty()) return 0;
+    size_t idx = static_cast<size_t>(std::ceil(pct / 100.0 * sorted.size())) - 1;
+    idx = std::min(idx, sorted.size() - 1);
+    return sorted[idx];
 }
 
-void print_stats(const std::string& label, std::vector<int64_t> latencies_ns) {
-    if (latencies_ns.empty()) {
-        std::cout << label << ": no samples" << std::endl;
-        return;
-    }
-    std::sort(latencies_ns.begin(), latencies_ns.end());
-    int64_t sum = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0LL);
-    double avg = static_cast<double>(sum) / latencies_ns.size();
+void print_stats(const std::string& label, std::vector<int64_t> lat) {
+    if (lat.empty()) { std::cout << label << ": no samples\n"; return; }
+    std::sort(lat.begin(), lat.end());
+    int64_t sum = std::accumulate(lat.begin(), lat.end(), 0LL);
+    std::cout << label << " (n=" << lat.size() << ")\n"
+              << "  avg:   " << static_cast<double>(sum) / lat.size() << " ns\n"
+              << "  p50:   " << percentile(lat, 50) << " ns\n"
+              << "  p90:   " << percentile(lat, 90) << " ns\n"
+              << "  p99:   " << percentile(lat, 99) << " ns\n"
+              << "  p99.9: " << percentile(lat, 99.9) << " ns\n"
+              << "  max:   " << lat.back() << " ns\n";
+}
 
-    std::cout << label << " (n=" << latencies_ns.size() << ")\n"
-              << "  avg:   " << avg << " ns\n"
-              << "  p50:   " << percentile(latencies_ns, 50) << " ns\n"
-              << "  p90:   " << percentile(latencies_ns, 90) << " ns\n"
-              << "  p99:   " << percentile(latencies_ns, 99) << " ns\n"
-              << "  p99.9: " << percentile(latencies_ns, 99.9) << " ns\n"
-              << "  max:   " << latencies_ns.back() << " ns\n";
+// Median cost of an empty now_ns() bracket — the stopwatch's own overhead.
+int64_t timer_overhead_ns() {
+    std::vector<int64_t> s;
+    s.reserve(200000);
+    for (int i = 0; i < 200000; ++i) {
+        int64_t a = HighResTimer::now_ns();
+        int64_t b = HighResTimer::now_ns();
+        s.push_back(b - a);
+    }
+    std::sort(s.begin(), s.end());
+    return percentile(s, 50);
+}
+
+// Resting-insert p50/p99 into a one-sided book holding ~num_levels price
+// levels, so the O(log L) cost is visible instead of hidden behind a tiny band.
+void bench_depth(uint32_t num_levels) {
+    constexpr int OPS = 50000;
+    OrderBook book;
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<uint32_t> price(1000, 1000 + num_levels - 1);
+    std::uniform_int_distribution<uint32_t> qty(10, 500);
+
+    uint64_t id = 1;
+    for (uint32_t p = 1000; p < 1000 + num_levels; ++p)
+        book.insert_order(id++, p, 100, /*is_buy=*/true);   // pre-fill L levels
+
+    std::vector<int64_t> lat; lat.reserve(OPS);
+    for (int i = 0; i < OPS; ++i) {
+        uint32_t p = price(rng);
+        int64_t t1 = HighResTimer::now_ns();
+        book.insert_order(id++, p, qty(rng), true);         // rests, never crosses
+        int64_t t2 = HighResTimer::now_ns();
+        lat.push_back(t2 - t1);
+    }
+    std::sort(lat.begin(), lat.end());
+    std::cout << "  L=" << num_levels << " levels:  p50=" << percentile(lat, 50)
+              << " ns   p99=" << percentile(lat, 99) << " ns\n";
+}
+
+// The intrusive-list cancel path — the headline design decision, previously
+// unmeasured. Cancels hit random queue positions.
+void bench_cancel() {
+    constexpr int OPS = 80000;
+    OrderBook book;
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<uint32_t> price(1000, 1200);
+    std::vector<uint64_t> ids; ids.reserve(OPS);
+    uint64_t id = 1;
+    for (int i = 0; i < OPS; ++i) { book.insert_order(id, price(rng), 100, true); ids.push_back(id++); }
+    std::shuffle(ids.begin(), ids.end(), rng);
+
+    std::vector<int64_t> lat; lat.reserve(OPS);
+    for (uint64_t cid : ids) {
+        int64_t t1 = HighResTimer::now_ns();
+        book.cancel_order(cid);
+        int64_t t2 = HighResTimer::now_ns();
+        lat.push_back(t2 - t1);
+    }
+    print_stats("Cancels (intrusive-list unlink)", lat);
 }
 
 }  // namespace
 
 int main() {
-    constexpr int NUM_ORDERS = 100000;
-    OrderBook book;
+    int64_t overhead = timer_overhead_ns();
+    std::cout << "--- Latency Benchmark ---\n";
+    std::cout << "Timer overhead (empty bracket, p50): " << overhead
+              << " ns  <-- subtract this from every figure for pure engine cost\n\n";
 
-    std::cout << "--- Running Latency Benchmark (" << NUM_ORDERS << " orders) ---" << std::endl;
-
-    // Fast PRNG for generating test order data
-    std::mt19937 rng(42);
-    std::uniform_int_distribution<uint32_t> price_dist(90, 110);
-    std::uniform_int_distribution<uint32_t> qty_dist(10, 500);
-    std::uniform_int_distribution<int> side_dist(0, 1);
-
-    // Track resting inserts and crossing/matching inserts separately —
-    // averaging them together hides that a matching sweep across several
-    // price levels is a fundamentally different cost than an O(1) resting
-    // insert, which matters more than the average for HFT-style latency work.
-    std::vector<int64_t> resting_latencies_ns;
-    std::vector<int64_t> crossing_latencies_ns;
-    resting_latencies_ns.reserve(NUM_ORDERS);
-    crossing_latencies_ns.reserve(NUM_ORDERS);
-
-    int64_t start_total_ns = HighResTimer::now_ns();
-
-    for (uint64_t id = 1; id <= NUM_ORDERS; ++id) {
-        uint32_t price = price_dist(rng);
-        uint32_t qty = qty_dist(rng);
-        bool is_buy = side_dist(rng) == 1;
-
-        // Determine ahead of time whether this order will cross the book,
-        // so we can bucket its latency correctly after the call.
-        bool will_cross = is_buy
-            ? (price >= book.get_best_ask())
-            : (price <= book.get_best_bid());
-
-        int64_t t1 = HighResTimer::now_ns();
-
-        book.insert_order(id, price, qty, is_buy);
-
-        int64_t t2 = HighResTimer::now_ns();
-
-        int64_t elapsed_ns = t2 - t1;
-        if (will_cross) {
-            crossing_latencies_ns.push_back(elapsed_ns);
-        } else {
-            resting_latencies_ns.push_back(elapsed_ns);
-        }
-    }
-
-    int64_t end_total_ns = HighResTimer::now_ns();
-    double total_time_ms = static_cast<double>(end_total_ns - start_total_ns) / 1e6;
-    double throughput_ops_sec = (NUM_ORDERS / total_time_ms) * 1000.0;
-
-    std::cout << "\n=== BENCHMARK RESULTS ===\n";
-    std::cout << "Total Orders Processed: " << NUM_ORDERS << "\n";
-    std::cout << "Total Wall Clock Time:  " << total_time_ms << " ms\n";
-    std::cout << "Throughput:             " << throughput_ops_sec / 1e6 << " Million ops/sec\n\n";
-    print_stats("Resting inserts (no match)", resting_latencies_ns);
+    std::cout << "Resting-insert latency vs. book depth (one-sided, no crossing):\n";
+    bench_depth(21);
+    bench_depth(1000);
+    bench_depth(20000);
     std::cout << "\n";
-    print_stats("Crossing inserts (matched against book)", crossing_latencies_ns);
-    std::cout << "=========================" << std::endl;
 
+    bench_cancel();
+
+    std::cout << "=========================" << std::endl;
     return 0;
 }
