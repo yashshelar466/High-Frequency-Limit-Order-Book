@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <iostream>
 #include <functional>
@@ -72,20 +74,39 @@ struct Trade {
     bool taker_is_buy;    // side of the aggressor
 };
 
-// 4. The OrderBook Class Interface
+// 4. Order time-in-force / type.
+//   LIMIT  – match what crosses, rest any remainder on the book (default).
+//   IOC    – Immediate-Or-Cancel: match what crosses now, discard the rest.
+//   FOK    – Fill-Or-Kill: fill the entire quantity immediately or do nothing.
+//   MARKET – ignore the price limit and take liquidity until filled or the
+//            opposite side is exhausted; never rests (remainder discarded).
+enum class OrderType { LIMIT, IOC, FOK, MARKET };
+
+// 5. One level of an L2 (market-by-price) depth snapshot.
+struct DepthLevel {
+    uint32_t price;
+    uint64_t volume;
+    uint32_t order_count;
+};
+
+// 6. The OrderBook Class Interface
 class OrderBook {
 private:
-    // Fixed array for direct O(1) price-level lookup (e.g., tick index)
-    static constexpr size_t MAX_PRICE_LEVELS = 100000;
-    PriceLevel* bids[MAX_PRICE_LEVELS] = {nullptr};
-    PriceLevel* asks[MAX_PRICE_LEVELS] = {nullptr};
+    // Ordered price -> level maps. Bids are keyed descending so begin() is the
+    // best (highest) bid; asks ascending so begin() is the best (lowest) ask.
+    // Levels are created lazily and erased the moment they empty, so a present
+    // key always maps to a non-empty level. Prices span the full uint32 range
+    // except the two reserved sentinels (see best-bid/ask getters).
+    std::map<uint32_t, PriceLevel*, std::greater<uint32_t>> bids;  // highest first
+    std::map<uint32_t, PriceLevel*> asks;                          // lowest first
 
     // Quick lookup from Order ID directly to the Order struct for O(1) cancels
     std::unordered_map<uint64_t, Order*> order_map;
 
-    // Tracking current best bid and ask prices
-    uint32_t best_bid_price = 0;
-    uint32_t best_ask_price = 0xFFFFFFFF;
+    // Reserved sentinel prices: 0 means "no bid", 0xFFFFFFFF means "no ask".
+    // Orders at these prices are rejected so the getters stay unambiguous.
+    static constexpr uint32_t NO_BID = 0;
+    static constexpr uint32_t NO_ASK = 0xFFFFFFFF;
 
 public:
     OrderBook() = default;
@@ -95,8 +116,12 @@ public:
     OrderBook(const OrderBook&) = delete;
     OrderBook& operator=(const OrderBook&) = delete;
 
-    // Core Matching Engine Methods
-    void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy);
+    // Core Matching Engine Methods. The 4-argument form is a plain LIMIT order;
+    // the 5-argument form selects the time-in-force / type (see OrderType).
+    void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy) {
+        insert_order(id, price, qty, is_buy, OrderType::LIMIT);
+    }
+    void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy, OrderType type);
     void cancel_order(uint64_t id);
 
     // Amend (cancel-replace) a resting order. Semantics follow exchange
@@ -120,40 +145,66 @@ public:
     using TradeHandler = std::function<void(const Trade&)>;
     void set_trade_handler(TradeHandler handler) { trade_handler = std::move(handler); }
 
-    // Getters for current top-of-book (Spread)
-    uint32_t get_best_bid() const { return best_bid_price; }
-    uint32_t get_best_ask() const { return best_ask_price; }
+    // Getters for current top-of-book. With the ordered maps the best price is
+    // simply the first key, so these are O(1). Empty sides report the reserved
+    // sentinels (0 for bids, 0xFFFFFFFF for asks).
+    uint32_t get_best_bid() const { return bids.empty() ? NO_BID : bids.begin()->first; }
+    uint32_t get_best_ask() const { return asks.empty() ? NO_ASK : asks.begin()->first; }
 
     // Read-only access to a price level, for tests that need to verify
     // FIFO ordering and volume/count bookkeeping rather than just the
-    // top-of-book price.
+    // top-of-book price. Returns nullptr when no order rests at that price.
     const PriceLevel* get_bid_level(uint32_t price) const {
-        return (price < MAX_PRICE_LEVELS) ? bids[price] : nullptr;
+        auto it = bids.find(price);
+        return it == bids.end() ? nullptr : it->second;
     }
     const PriceLevel* get_ask_level(uint32_t price) const {
-        return (price < MAX_PRICE_LEVELS) ? asks[price] : nullptr;
+        auto it = asks.find(price);
+        return it == asks.end() ? nullptr : it->second;
+    }
+
+    // L2 (market-by-price) depth snapshots: up to `levels` price levels from the
+    // top of each side, best first (bids high→low, asks low→high). Ordered map
+    // iteration makes these O(levels), independent of how sparse the book is.
+    std::vector<DepthLevel> get_bid_depth(size_t levels) const {
+        return snapshot(bids, levels);
+    }
+    std::vector<DepthLevel> get_ask_depth(size_t levels) const {
+        return snapshot(asks, levels);
+    }
+
+    // Spread and mid-price convenience helpers. Both return 0 when either side
+    // of the book is empty (no two-sided market to quote).
+    uint32_t spread() const {
+        if (bids.empty() || asks.empty()) return 0;
+        return get_best_ask() - get_best_bid();
+    }
+    double mid_price() const {
+        if (bids.empty() || asks.empty()) return 0.0;
+        return (static_cast<double>(get_best_bid()) + get_best_ask()) / 2.0;
     }
 
     private:
-    // Re-establish the top-of-book invariant after a matching sweep may have
-    // depleted one or more levels: best_ask_price must point at the lowest
-    // live ask (best_bid_price at the highest live bid), or the empty-side
-    // sentinel when that side of the book holds no orders. The matching loop
-    // only advances these as a lower/upper bound, so it can leave them parked
-    // on an empty slot or a price gap — these normalize that.
-    void normalize_best_ask() {
-        while (best_ask_price < MAX_PRICE_LEVELS &&
-               (!asks[best_ask_price] || !asks[best_ask_price]->head)) {
-            best_ask_price++;
+    // Build a depth snapshot from either side's ordered map (iteration order is
+    // already best-first for both, thanks to the maps' comparators).
+    template <typename Side>
+    static std::vector<DepthLevel> snapshot(const Side& side, size_t levels) {
+        std::vector<DepthLevel> out;
+        out.reserve(levels < side.size() ? levels : side.size());
+        for (const auto& kv : side) {
+            if (out.size() >= levels) break;
+            out.push_back(DepthLevel{kv.first, kv.second->total_volume, kv.second->order_count});
         }
-        if (best_ask_price >= MAX_PRICE_LEVELS) best_ask_price = 0xFFFFFFFF;
+        return out;
     }
-    void normalize_best_bid() {
-        while (best_bid_price > 0 &&
-               (!bids[best_bid_price] || !bids[best_bid_price]->head)) {
-            best_bid_price--;
-        }
-    }
+
+    // Match an incoming aggressor against the opposite side up to `limit_price`
+    // (inclusive), emitting a Trade per fill. Returns the unfilled remainder.
+    uint32_t match_incoming(uint64_t taker_id, uint32_t limit_price, uint32_t qty, bool is_buy);
+
+    // Read-only check used by FOK: is there enough resting liquidity at prices
+    // that satisfy `limit_price` to completely fill `qty` right now?
+    bool can_fully_fill(uint32_t limit_price, uint32_t qty, bool is_buy) const;
 
     MemoryPool<Order> order_pool;
     TradeHandler trade_handler;

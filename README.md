@@ -6,13 +6,15 @@
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A single-threaded limit order book matching engine built in C++17, designed for low-latency execution and deterministic backtesting. Implements O(1) price-time priority matching, custom memory pool allocation, and a CSV-driven market data replayer for simulating tick-level trading strategies.
+A single-threaded limit order book matching engine built in C++17, designed for low-latency execution and deterministic backtesting. Implements price-time priority matching over ordered price maps, a custom memory pool allocator, LIMIT/IOC/FOK/MARKET order types, L2 depth snapshots, and a CSV-driven market data replayer for simulating tick-level trading strategies.
 
 ## Table of Contents
 - [Overview](#overview)
 - [Performance](#performance)
 - [Design & Architecture](#design--architecture)
 - [Key Optimizations](#key-optimizations)
+- [Order Types](#order-types)
+- [L2 Depth Snapshots](#l2-depth-snapshots)
 - [Trade & Execution Reporting](#trade--execution-reporting)
 - [Testing](#testing)
 - [Market Data Feed & Replayer](#market-data-feed--replayer)
@@ -25,40 +27,42 @@ This project implements the core matching logic used in real exchange systems: o
 
 ## Performance
 
-Benchmarked on 100,000 randomized order operations (inserts, executions, cancellations), compiled with `-O3`. Timed using `QueryPerformanceCounter` for reliable nanosecond-resolution measurement on Windows.
+Benchmarked on 100,000 randomized order operations (inserts, executions, cancellations) over a 21-tick price band, compiled with `-O3`.
 
 | Metric               | Result                  |
 | -------------------- | ------------------------ |
-| Throughput           | 4.30M ops/sec             |
-| Total Execution Time | ~23.28 ms (100k orders)   |
+| Throughput           | ~4.5M ops/sec             |
+| Total Execution Time | ~22 ms (100k orders)      |
 
-Latency is reported separately for resting inserts (no match) and crossing inserts (matched against the book), since a multi-level matching sweep is a fundamentally different cost than an O(1) resting insert — a single blended average hides that distinction.
+Latency is reported separately for resting inserts (no match) and crossing inserts (matched against the book), since a multi-level matching sweep is a fundamentally different cost than a plain resting insert — a single blended average hides that distinction.
 
-**Resting inserts (no match)** — n=55,804
-
-| Percentile | Latency    |
-| ---------- | ---------- |
-| avg        | 185.5 ns   |
-| p50        | 200 ns     |
-| p90        | 200 ns     |
-| p99        | 400 ns     |
-| p99.9      | 1,000 ns   |
-| max        | 213,500 ns |
-
-**Crossing inserts (matched against book)** — n=44,196
+**Resting inserts (no match)** — n=56,332
 
 | Percentile | Latency    |
 | ---------- | ---------- |
-| avg        | 166.1 ns   |
-| p50        | 100 ns     |
-| p90        | 300 ns     |
-| p99        | 500 ns     |
-| p99.9      | 900 ns     |
-| max        | 102,700 ns |
+| avg        | 161 ns     |
+| p50        | 126 ns     |
+| p90        | 190 ns     |
+| p99        | 319 ns     |
+| p99.9      | 3,769 ns   |
+| max        | 325,425 ns |
 
-> The max values above are 100-200x larger than p99.9, which points to OS scheduler jitter (context switches, page faults) rather than the matching engine itself — the p99.9 column is the more representative worst case for the algorithm's actual behavior.
+**Crossing inserts (matched against book)** — n=43,668
 
-**Test Environment:** Windows 11, Intel Core i7 / AMD Ryzen 7, GCC 13.2 (MinGW-w64)
+| Percentile | Latency   |
+| ---------- | --------- |
+| avg        | 166 ns    |
+| p50        | 137 ns    |
+| p90        | 287 ns    |
+| p99        | 456 ns    |
+| p99.9      | 743 ns    |
+| max        | 62,885 ns |
+
+> The max values are 100-1000x larger than p99.9, which points to OS scheduler jitter (context switches, page faults) rather than the matching engine itself — the p99.9 column is the more representative worst case for the algorithm's actual behavior.
+
+> **Design note:** price levels are held in ordered `std::map`s, so lookup/insert/erase is `O(log L)` in the number of *distinct live price levels* `L` (typically small), not the earlier fixed-array `O(1)`. This trades a modest, measured latency cost (≈40 ns at the median) for an uncapped price range and correct, cheap L2 depth snapshots. The O(1) memory pool is unchanged.
+
+**Test Environment:** Ubuntu 24.04, Intel Xeon @ 2.80GHz, GCC 13.3, `std::chrono::steady_clock`.
 > Latency numbers are meaningless without hardware context — always report the machine a benchmark ran on.
 
 ## Design & Architecture
@@ -79,8 +83,9 @@ Latency is reported separately for resting inserts (no match) and crossing inser
                  ▼                           ▼
         ┌────────────────┐         ┌────────────────┐
         │   Bid Levels     │         │   Ask Levels     │
-        │ (price → FIFO    │         │ (price → FIFO    │
-        │  linked list)    │         │  linked list)    │
+        │  std::map desc   │         │  std::map asc    │
+        │  price → FIFO    │         │  price → FIFO    │
+        │  linked list     │         │  linked list     │
         └────────────────┘         └────────────────┘
                  │                           │
                  └─────────────┬─────────────┘
@@ -91,13 +96,47 @@ Latency is reported separately for resting inserts (no match) and crossing inser
                     └─────────────────────┘
 ```
 
-Each price level is an intrusive doubly-linked list, so cancellation is O(1) (unlink in place, no shifting) and new orders at an existing price level append in O(1). Price levels themselves are indexed for O(1) best-bid/best-ask lookup rather than requiring a tree traversal.
+Each side of the book is an ordered `std::map` from price to price level — bids descending, asks ascending — so the best bid/ask is always the first key (`begin()`), and depth walks in price order for free. Each price level is an intrusive doubly-linked list, so cancellation is O(1) (unlink in place, no shifting) and appending a new order at an existing level is O(1); locating or creating the level is `O(log L)` in the number of distinct live price levels `L`. The full `uint32` price range is supported (only `0` and `0xFFFFFFFF` are reserved as empty-side sentinels).
 
 ## Key Optimizations
 
 **Zero-allocation execution.** A custom contiguous `MemoryPool<Order>` uses placement `new` to pre-allocate order objects, eliminating `malloc`/`free` calls — and the latency jitter they introduce — from the hot path. This alone accounted for a >50% latency improvement over naive heap allocation.
 
-**O(1) price-time matching.** Intrusive doubly-linked lists per price level, combined with direct array indexing into price levels, keep both order placement and cancellation constant-time regardless of book depth.
+**Ordered price maps.** Bids and asks are ordered maps, so top-of-book is `begin()` (no scanning), depleted levels drop out cleanly, and L2 depth snapshots are a direct ordered walk. Level lookup is `O(log L)` in the number of live price levels — a deliberate trade against the previous fixed-array `O(1)` in exchange for an uncapped price range and correct, cheap depth queries.
+
+## Order Types
+
+The engine supports the standard time-in-force / order types via an `OrderType` argument to `insert_order` (the 4-argument form defaults to `LIMIT`):
+
+| Type     | Behavior |
+| -------- | -------- |
+| `LIMIT`  | Match whatever crosses the limit price, then rest any remainder on the book. |
+| `IOC`    | Immediate-Or-Cancel: match what crosses now, discard the remainder (never rests). |
+| `FOK`    | Fill-Or-Kill: fill the entire quantity immediately, or do nothing at all. |
+| `MARKET` | Ignore the price limit and take liquidity until filled or the opposite side is exhausted; never rests. |
+
+```cpp
+book.insert_order(1, 105, 30, false);                    // resting LIMIT ask
+book.insert_order(2, 105, 50, true, OrderType::IOC);     // fills 30, drops the rest
+book.insert_order(3, 0,  40, true, OrderType::MARKET);   // price ignored; sweeps the book
+```
+
+`FOK` first checks resting liquidity (an ordered walk of the opposite side) and only proceeds if the full size can be filled, so it never leaves a partial fill behind.
+
+## L2 Depth Snapshots
+
+Because each side of the book is an ordered map, market-by-price depth is a direct top-of-book walk:
+
+```cpp
+for (const DepthLevel& lvl : book.get_ask_depth(5))   // best 5 ask levels, low -> high
+    std::cout << lvl.price << " x " << lvl.volume << " (" << lvl.order_count << ")\n";
+
+book.get_bid_depth(5);   // best 5 bid levels, high -> low
+book.spread();           // best_ask - best_bid (0 if one-sided)
+book.mid_price();        // (best_bid + best_ask) / 2 (0 if one-sided)
+```
+
+Each `DepthLevel` carries `{ price, volume, order_count }`. The replayer prints a top-5 snapshot plus spread/mid after a run.
 
 ## Trade & Execution Reporting
 
@@ -122,7 +161,7 @@ Trades execute at the resting maker's price (price-time priority), so a single c
 Two layers of tests guard the matching engine:
 
 - **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, and top-of-book reset after a level is emptied.
-- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random ADD / CANCEL / AMEND / duplicate-ID / crossing operations at both the production engine and a deliberately simple `std::map`-based reference model, asserting they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
+- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random operations — LIMIT / IOC / FOK / MARKET inserts, cancels, amends, duplicate-ID attempts, and crossings — at both the production engine and a deliberately simple `std::map`-based reference model, asserting they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
 
 CI additionally rebuilds and runs both suites under AddressSanitizer + UndefinedBehaviorSanitizer, since the hot path mixes a custom memory pool with raw allocation.
 

@@ -48,34 +48,67 @@ public:
     std::vector<Trade> trades;  // fills produced by the most recent operation
 
     void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy) {
-        if (price >= MAX_PRICE_LEVELS || qty == 0) return;
+        insert_order(id, price, qty, is_buy, OrderType::LIMIT);
+    }
+
+    void insert_order(uint64_t id, uint32_t price, uint32_t qty, bool is_buy, OrderType type) {
+        if (qty == 0) return;
+        if (type != OrderType::MARKET && (price == EMPTY_BID || price == EMPTY_ASK)) return;
         if (live.count(id)) return;  // duplicate live ID rejected
 
-        if (is_buy) {
-            // Cross against the lowest asks priced at or below our limit.
-            while (qty > 0 && !asks.empty() && asks.begin()->first <= price) {
-                uint32_t lvl_price = asks.begin()->first;
-                Level& fifo = asks.begin()->second;
-                match_into(fifo, qty, id, lvl_price, true);
-                if (fifo.empty()) asks.erase(asks.begin());
-            }
-            if (qty > 0) {
-                bids[price].push_back({id, qty});
+        uint32_t limit = price;
+        if (type == OrderType::MARKET) limit = is_buy ? EMPTY_ASK : EMPTY_BID;
+        if (type == OrderType::FOK && !can_fully_fill(limit, qty, is_buy)) return;
+
+        uint32_t remaining = match(id, limit, qty, is_buy);
+
+        if (remaining > 0 && type == OrderType::LIMIT) {
+            if (is_buy) {
+                bids[price].push_back({id, remaining});
                 live[id] = {price, true};
-            }
-        } else {
-            // Cross against the highest bids priced at or above our limit.
-            while (qty > 0 && !bids.empty() && bids.begin()->first >= price) {
-                uint32_t lvl_price = bids.begin()->first;
-                Level& fifo = bids.begin()->second;
-                match_into(fifo, qty, id, lvl_price, false);
-                if (fifo.empty()) bids.erase(bids.begin());
-            }
-            if (qty > 0) {
-                asks[price].push_back({id, qty});
+            } else {
+                asks[price].push_back({id, remaining});
                 live[id] = {price, false};
             }
         }
+    }
+
+    // Match an aggressor against the opposite side up to `limit`; return leftover.
+    uint32_t match(uint64_t taker_id, uint32_t limit, uint32_t qty, bool is_buy) {
+        if (is_buy) {
+            while (qty > 0 && !asks.empty() && asks.begin()->first <= limit) {
+                uint32_t lvl_price = asks.begin()->first;
+                Level& fifo = asks.begin()->second;
+                match_into(fifo, qty, taker_id, lvl_price, true);
+                if (fifo.empty()) asks.erase(asks.begin());
+            }
+        } else {
+            while (qty > 0 && !bids.empty() && bids.begin()->first >= limit) {
+                uint32_t lvl_price = bids.begin()->first;
+                Level& fifo = bids.begin()->second;
+                match_into(fifo, qty, taker_id, lvl_price, false);
+                if (fifo.empty()) bids.erase(bids.begin());
+            }
+        }
+        return qty;
+    }
+
+    bool can_fully_fill(uint32_t limit, uint32_t qty, bool is_buy) const {
+        uint64_t available = 0;
+        if (is_buy) {
+            for (const auto& kv : asks) {
+                if (kv.first > limit) break;
+                for (const auto& e : kv.second) available += e.qty;
+                if (available >= qty) return true;
+            }
+        } else {
+            for (const auto& kv : bids) {
+                if (kv.first < limit) break;
+                for (const auto& e : kv.second) available += e.qty;
+                if (available >= qty) return true;
+            }
+        }
+        return available >= qty;
     }
 
     void cancel_order(uint64_t id) {
@@ -95,7 +128,7 @@ public:
     void amend_order(uint64_t id, uint32_t new_price, uint32_t new_qty) {
         auto it = live.find(id);
         if (it == live.end()) return;
-        if (new_qty == 0 || new_price >= MAX_PRICE_LEVELS) return;
+        if (new_qty == 0 || new_price == EMPTY_BID || new_price == EMPTY_ASK) return;
         uint32_t price = it->second.first;
         bool is_buy = it->second.second;
 
@@ -305,8 +338,18 @@ int main() {
             uint32_t qty = qty_dist(rng);
             bool is_buy = side_dist(rng) == 1;
 
-            fast.insert_order(id, price, qty, is_buy);
-            ref.insert_order(id, price, qty, is_buy);
+            // Mix in the non-resting order types so their matching, kill, and
+            // remainder-discard behavior is checked against the reference too.
+            OrderType type = OrderType::LIMIT;
+            switch (rng() % 10) {
+                case 0: type = OrderType::IOC; break;
+                case 1: type = OrderType::FOK; break;
+                case 2: type = OrderType::MARKET; break;
+                default: type = OrderType::LIMIT; break;
+            }
+
+            fast.insert_order(id, price, qty, is_buy, type);
+            ref.insert_order(id, price, qty, is_buy, type);
         }
 
         // Cheap invariant checked on every single op.
