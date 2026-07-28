@@ -35,6 +35,23 @@ int main() {
         std::cout << "\n--- Final Order Book State ---" << std::endl;
         std::cout << "Best Bid Price: " << book.get_best_bid() << std::endl;
         std::cout << "Best Ask Price: " << book.get_best_ask() << std::endl;
+        if (book.get_best_bid() != 0 && book.get_best_ask() != 0xFFFFFFFF) {
+            std::cout << "Spread:         " << book.spread()
+                      << "   Mid: " << book.mid_price() << std::endl;
+        }
+
+        std::cout << "\n--- L2 Depth (top 5) ---" << std::endl;
+        std::cout << "Asks (low -> high):" << std::endl;
+        auto asks = book.get_ask_depth(5);
+        for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
+            std::cout << "  " << it->price << "  x " << it->volume
+                      << "  (" << it->order_count << " orders)" << std::endl;
+        }
+        std::cout << "Bids (high -> low):" << std::endl;
+        for (const auto& lvl : book.get_bid_depth(5)) {
+            std::cout << "  " << lvl.price << "  x " << lvl.volume
+                      << "  (" << lvl.order_count << " orders)" << std::endl;
+        }
     }
 
     return 0;

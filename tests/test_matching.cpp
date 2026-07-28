@@ -54,12 +54,22 @@ void test_order_cancellation() {
 void test_invalid_inputs() {
     OrderBook book;
 
-    // Zero quantity order should be ignored safely
+    // Zero quantity order should be ignored safely.
     book.insert_order(1, 100, 0, true);
-    assert(book.get_best_bid() != 100);
+    assert(book.get_best_bid() == 0);   // empty-bid sentinel
 
-    // Out of bounds price should be ignored safely
-    book.insert_order(2, 1000000, 50, true);
+    // Reserved sentinel prices (0 and 0xFFFFFFFF) are rejected so the
+    // top-of-book getters stay unambiguous.
+    book.insert_order(2, 0, 50, true);
+    assert(book.get_best_bid() == 0);
+    book.insert_order(3, 0xFFFFFFFF, 50, false);
+    assert(book.get_best_ask() == 0xFFFFFFFF);
+
+    // A large price that the old fixed [100000] array would have rejected is
+    // now a perfectly valid resting order (uncapped uint32 range).
+    book.insert_order(4, 1000000, 50, true);
+    assert(book.get_best_bid() == 1000000);
+    assert(book.get_bid_level(1000000) != nullptr);
 
     std::cout << "[PASS] Invalid Inputs Test" << std::endl;
 }
@@ -346,13 +356,144 @@ void test_amend_unknown_and_invalid_noop() {
 
     book.amend_order(999, 105, 10);  // unknown id
     book.amend_order(1, 105, 0);     // zero qty
-    book.amend_order(1, 1000000, 10);// out-of-range price
+    book.amend_order(1, 0, 10);      // reserved sentinel price
 
     const PriceLevel* lvl = book.get_ask_level(105);
     assert(lvl != nullptr && lvl->order_count == 1 && lvl->total_volume == 40);
     assert(lvl->head->id == 1 && lvl->head->qty == 40);
 
     std::cout << "[PASS] Amend Unknown/Invalid No-op Test" << std::endl;
+}
+
+void test_l2_depth_snapshot() {
+    OrderBook book;
+
+    // Two-sided book: bids at 100 (two orders), 99, 98; asks at 105, 106.
+    book.insert_order(1, 100, 10, true);
+    book.insert_order(2, 99, 20, true);
+    book.insert_order(3, 98, 30, true);
+    book.insert_order(4, 100, 5, true);    // joins the 100 level
+    book.insert_order(5, 105, 40, false);
+    book.insert_order(6, 106, 50, false);
+
+    // Bid depth is best-first (high -> low) and aggregates a level's orders.
+    auto bd = book.get_bid_depth(2);
+    assert(bd.size() == 2);
+    assert(bd[0].price == 100 && bd[0].volume == 15 && bd[0].order_count == 2);
+    assert(bd[1].price == 99 && bd[1].volume == 20 && bd[1].order_count == 1);
+
+    // Asking for more levels than exist returns only what's there (low -> high).
+    auto ad = book.get_ask_depth(5);
+    assert(ad.size() == 2);
+    assert(ad[0].price == 105 && ad[0].volume == 40);
+    assert(ad[1].price == 106 && ad[1].volume == 50);
+
+    assert(book.spread() == 5);         // 105 - 100
+    assert(book.mid_price() == 102.5);  // (100 + 105) / 2
+
+    std::cout << "[PASS] L2 Depth Snapshot Test" << std::endl;
+}
+
+void test_depth_empty_and_one_sided() {
+    OrderBook book;
+
+    assert(book.get_bid_depth(5).empty());
+    assert(book.get_ask_depth(5).empty());
+    assert(book.spread() == 0);
+    assert(book.mid_price() == 0.0);
+
+    // With only one side populated there is no two-sided market to quote.
+    book.insert_order(1, 100, 10, true);
+    assert(book.get_bid_depth(5).size() == 1);
+    assert(book.spread() == 0);
+    assert(book.mid_price() == 0.0);
+
+    std::cout << "[PASS] Depth Empty / One-Sided Book Test" << std::endl;
+}
+
+void test_ioc_discards_remainder() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    book.insert_order(1, 105, 30, false);                       // resting ask 30
+    book.insert_order(2, 105, 50, true, OrderType::IOC);        // fills 30, drops 20
+
+    assert(trades.size() == 1 && trades[0].qty == 30);
+    assert(book.get_ask_level(105) == nullptr);
+    assert(book.get_bid_level(105) == nullptr);   // remainder NOT rested
+    assert(book.get_best_bid() == 0);
+
+    std::cout << "[PASS] IOC Discards Remainder Test" << std::endl;
+}
+
+void test_fok_kills_when_insufficient() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    book.insert_order(1, 105, 30, false);                       // only 30 available
+    book.insert_order(2, 105, 50, true, OrderType::FOK);        // needs 50 -> kill
+
+    assert(trades.empty());                        // nothing executed
+    const PriceLevel* lvl = book.get_ask_level(105);
+    assert(lvl != nullptr && lvl->total_volume == 30);   // book untouched
+    assert(book.get_bid_level(105) == nullptr);
+
+    std::cout << "[PASS] FOK Kills When Insufficient Test" << std::endl;
+}
+
+void test_fok_fills_when_sufficient() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    book.insert_order(1, 105, 30, false);
+    book.insert_order(2, 106, 40, false);
+    book.insert_order(3, 106, 50, true, OrderType::FOK);   // 30@105 + 20@106 = 50
+
+    assert(trades.size() == 2);
+    assert(trades[0].price == 105 && trades[0].qty == 30);
+    assert(trades[1].price == 106 && trades[1].qty == 20);
+    assert(book.get_ask_level(105) == nullptr);
+    const PriceLevel* lvl = book.get_ask_level(106);
+    assert(lvl != nullptr && lvl->total_volume == 20);
+    assert(book.get_bid_level(106) == nullptr);   // FOK never rests
+
+    std::cout << "[PASS] FOK Fills When Sufficient Test" << std::endl;
+}
+
+void test_market_order_sweeps_ignoring_price() {
+    OrderBook book;
+    std::vector<Trade> trades;
+    book.set_trade_handler([&](const Trade& t) { trades.push_back(t); });
+
+    book.insert_order(1, 105, 20, false);
+    book.insert_order(2, 107, 20, false);
+    // MARKET buy 30: price field ignored; takes 20@105 then 10@107.
+    book.insert_order(3, 0, 30, true, OrderType::MARKET);
+
+    assert(trades.size() == 2);
+    assert(trades[0].price == 105 && trades[0].qty == 20);
+    assert(trades[1].price == 107 && trades[1].qty == 10);
+    assert(book.get_ask_level(105) == nullptr);
+    assert(book.get_ask_level(107) != nullptr && book.get_ask_level(107)->total_volume == 10);
+
+    std::cout << "[PASS] Market Order Sweeps Ignoring Price Test" << std::endl;
+}
+
+void test_market_order_empty_book_noop() {
+    OrderBook book;
+    int count = 0;
+    book.set_trade_handler([&](const Trade&) { ++count; });
+
+    book.insert_order(1, 100, 50, true, OrderType::MARKET);   // nothing to hit
+
+    assert(count == 0);
+    assert(book.get_best_bid() == 0);   // market never rests
+    assert(book.get_best_ask() == 0xFFFFFFFF);
+
+    std::cout << "[PASS] Market Order Empty Book No-op Test" << std::endl;
 }
 
 int main() {
@@ -376,6 +517,13 @@ int main() {
     test_amend_qty_increase_loses_priority();
     test_amend_into_cross_executes();
     test_amend_unknown_and_invalid_noop();
+    test_l2_depth_snapshot();
+    test_depth_empty_and_one_sided();
+    test_ioc_discards_remainder();
+    test_fok_kills_when_insufficient();
+    test_fok_fills_when_sufficient();
+    test_market_order_sweeps_ignoring_price();
+    test_market_order_empty_book_noop();
     std::cout << "--- All Tests Passed Successfully! ---" << std::endl;
     return 0;
 }
