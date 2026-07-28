@@ -150,12 +150,13 @@ Trades execute at the resting maker's price (price-time priority), so a single c
 
 ## Testing
 
-Two layers of tests guard the matching engine:
+Three suites guard the matching engine:
 
-- **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, and top-of-book reset after a level is emptied.
-- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random operations — LIMIT / IOC / FOK / MARKET inserts, cancels, amends, duplicate-ID attempts, and crossings — at both the production engine and a deliberately simple `std::map`-based reference model, asserting they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
+- **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, top-of-book reset after a level is emptied, amend/cancel-replace priority semantics, IOC/FOK/MARKET handling, and L2 depth snapshots (including empty and one-sided books).
+- **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random operations — LIMIT / IOC / FOK / MARKET inserts, cancels, amends, duplicate-ID attempts, and crossings — at both the production engine and a deliberately simple `std::map`-based reference model, checking they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
+- **Allocator lifetime test** (`tests/test_memorypool.cpp`) exercises `MemoryPool<T>` with a non-trivially-destructible `T`. The pool is backed by raw uninitialized storage and destroys each object exactly once (on `deallocate`), so its own teardown can't double-destroy a slot — a bug that stays invisible with a trivially-destructible type like `Order` and only surfaces under a type that owns a heap buffer.
 
-CI additionally rebuilds and runs both suites under AddressSanitizer + UndefinedBehaviorSanitizer, since the hot path mixes a custom memory pool with raw allocation.
+**Checks are never compiled out.** All assertions go through a `CHECK` macro (`tests/check.hpp`) that prints the failed expression and exits non-zero, rather than `assert`, which expands to nothing whenever `NDEBUG` is defined — as it is in any optimized Release build. CI therefore runs the suites in **Debug and Release**, plus a third pass under **AddressSanitizer + UndefinedBehaviorSanitizer** (explicitly a Debug build, so the sanitizers aren't weakened by `-O3`/`NDEBUG`). A red CI job means a real failure; injecting a deliberate bug into the matching path turns the suites red in every configuration.
 
 ## Market Data Feed & Replayer
 
@@ -167,15 +168,25 @@ An event-driven `MarketDataFeed` parser streams tick data into the engine:
 
 ```
 Limit-Order-Book/
-├── include/              # Public headers (OrderBook, MemoryPool, Order)
+├── include/                     # Public headers
+│   ├── OrderBook.hpp             # Book, Order, PriceLevel, Trade, DepthLevel
+│   ├── MemoryPool.hpp            # Pooled allocator over raw storage
+│   └── MarketDataFeed.hpp        # CSV tick parser / replayer
 ├── src/
-│   ├── OrderBook.cpp      # Core matching engine
-│   └── replay_main.cpp    # Market data replayer entry point
+│   ├── OrderBook.cpp             # Core matching engine
+│   ├── replay_main.cpp           # Market data replayer entry point
+│   └── main.cpp                  # Minimal usage example
 ├── tests/
-│   ├── test_matching.cpp     # Unit tests for matching logic
-│   └── test_differential.cpp # Randomized differential test vs. reference model
+│   ├── check.hpp                 # CHECK macro (survives NDEBUG — see Testing)
+│   ├── test_matching.cpp         # Unit tests for matching logic
+│   ├── test_differential.cpp     # Randomized differential test vs. reference model
+│   └── test_memorypool.cpp       # Allocator lifetime test (non-trivial types)
 ├── benchmarks/
 │   └── benchmark_latency.cpp
+├── data/
+│   └── ticks.csv                 # Sample tick data for the replayer
+├── .github/workflows/ci.yml      # Debug + Release + sanitizer CI
+├── CMakeLists.txt
 └── README.md
 ```
 
@@ -197,7 +208,7 @@ cd High-Frequency-Limit-Order-Book
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-# Run the test suites (unit + randomized differential) via CTest
+# Run the test suites (unit + differential + allocator) via CTest
 ctest --test-dir build --output-on-failure
 
 # Run the individual binaries
@@ -209,7 +220,8 @@ ctest --test-dir build --output-on-failure
 To build and test with sanitizers (as CI does):
 
 ```bash
-cmake -S . -B build-san -DENABLE_SANITIZERS=ON
+# Debug is explicit: ASan/UBSan lose coverage under -O3/NDEBUG.
+cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
 cmake --build build-san -j
 ctest --test-dir build-san --output-on-failure
 ```
@@ -221,6 +233,7 @@ No CMake? Each target is a single translation unit plus `src/OrderBook.cpp`:
 ```bash
 g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests && ./run_tests
 g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff && ./run_diff
+g++ -std=c++17 tests/test_memorypool.cpp -o run_pool && ./run_pool
 g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark && ./run_benchmark
 g++ -std=c++17 -Iinclude src/OrderBook.cpp src/replay_main.cpp -o run_feed && ./run_feed
 ```
