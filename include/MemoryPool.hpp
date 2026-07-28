@@ -3,22 +3,36 @@
 #include <cstddef>
 #include <iostream>
 #include <unordered_set>
+#include <utility>
+#include <new>
 
+// Fixed-capacity object pool over RAW, uninitialized storage. Each slot is
+// constructed via placement-new on allocate() and destroyed via an explicit
+// ~T() on deallocate(). The backing store is raw bytes (not std::vector<T>),
+// so the pool's own teardown does NOT run T's destructor again. The previous
+// vector<T>-backed version default-constructed every slot and then re-destroyed
+// slots already destroyed in deallocate() — a latent double-free for any
+// non-trivially-destructible T (invisible only because Order is trivial).
 template <typename T, size_t BlockSize = 100000>
 class MemoryPool {
 public:
     MemoryPool() {
-        // Pre-allocate memory block
-        pool.resize(BlockSize);
+        storage_ = new Slot[BlockSize];   // raw aligned bytes; no T constructed
         free_list.reserve(BlockSize);
-
-        // Populate free list with pointers to pre-allocated objects
-        for (size_t i = 0; i < BlockSize; ++i) {
-            free_list.push_back(&pool[i]);
-        }
+        for (size_t i = 0; i < BlockSize; ++i)
+            free_list.push_back(reinterpret_cast<T*>(&storage_[i]));
     }
 
-    // Allocate an object from the pool without hitting OS heap
+    ~MemoryPool() {
+        // Raw bytes: nothing is destructed here. Contract: the owner
+        // deallocate()s every live object before the pool dies (OrderBook's
+        // destructor releases all live orders via order_map).
+        delete[] storage_;
+    }
+
+    MemoryPool(const MemoryPool&) = delete;             // owns raw storage
+    MemoryPool& operator=(const MemoryPool&) = delete;
+
     template <typename... Args>
     T* allocate(Args&&... args) {
         if (free_list.empty()) {
@@ -27,49 +41,32 @@ public:
             heap_allocated.insert(heap_ptr);
             return heap_ptr;
         }
-
         T* ptr = free_list.back();
         free_list.pop_back();
-
-        // Construct object in-place using placement new
-        return new (ptr) T(std::forward<Args>(args)...);
+        return new (ptr) T(std::forward<Args>(args)...);   // placement new
     }
 
-    // Return object to pool free list for reuse, or to the real heap
-    // if it was a fallback allocation.
     void deallocate(T* ptr) {
         if (!ptr) return;
-
         auto it = heap_allocated.find(ptr);
         if (it != heap_allocated.end()) {
-            // This pointer never lived in `pool` — it must go through
-            // delete, not back onto free_list, or free_list ends up
-            // holding a dangling pointer outside the pool's storage.
-            delete ptr;
+            delete ptr;                     // overflow object lived on the heap
             heap_allocated.erase(it);
             return;
         }
-
-        // Call destructor explicitly
-        ptr->~T();
-
-        // Return memory location to free list
-        free_list.push_back(ptr);
+        ptr->~T();                          // destroy the pooled object once
+        free_list.push_back(ptr);           // return the raw slot for reuse
     }
 
-    size_t available() const {
-        return free_list.size();
-    }
-
-    // Number of live objects that overflowed into raw heap allocation.
-    // Non-zero means BlockSize was too small for this run — worth
-    // sizing the pool to the real order volume instead of leaving this at 0.
-    size_t heap_overflow_count() const {
-        return heap_allocated.size();
-    }
+    size_t available() const { return free_list.size(); }
+    size_t heap_overflow_count() const { return heap_allocated.size(); }
 
 private:
-    std::vector<T> pool;
+    // Raw storage sized/aligned for one T, holding no live object until
+    // placement-new'd. std::byte (not the C++23-deprecated aligned_storage).
+    struct alignas(T) Slot { unsigned char data[sizeof(T)]; };
+
+    Slot* storage_ = nullptr;
     std::vector<T*> free_list;
     std::unordered_set<T*> heap_allocated;
 };

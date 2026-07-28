@@ -27,42 +27,34 @@ This project implements the core matching logic used in real exchange systems: o
 
 ## Performance
 
-Benchmarked on 100,000 randomized order operations (inserts, executions, cancellations) over a 21-tick price band, compiled with `-O3`.
+Latency is measured with `-O3` and reported **across book depths**, since level lookup is `O(log L)` in the number of live price levels `L` — a single narrow band would flatter the numbers. Resting inserts and cancels are reported separately because they exercise different code paths.
 
-| Metric               | Result                  |
-| -------------------- | ------------------------ |
-| Throughput           | ~4.5M ops/sec             |
-| Total Execution Time | ~22 ms (100k orders)      |
+> **Timer-resolution caveat.** On this Windows machine `QueryPerformanceCounter` ticks at ~100 ns, so every figure below is quantized to 100 ns, and the empty-bracket timer overhead (p50) measures as 0 ns — i.e. below a single clock tick. Treat these as ~100 ns-resolution measurements: the **trend across depth** is the meaningful signal, not the absolute value of any one bucket. On Linux the benchmark falls back to `std::chrono::steady_clock` (true nanosecond resolution).
 
-Latency is reported separately for resting inserts (no match) and crossing inserts (matched against the book), since a multi-level matching sweep is a fundamentally different cost than a plain resting insert — a single blended average hides that distinction.
+**Resting-insert latency vs. book depth** (one-sided book, no crossing; n = 50,000 per row)
 
-**Resting inserts (no match)** — n=56,332
+| Live price levels (L) | p50    | p99      |
+| --------------------- | ------ | -------- |
+| 21                    | 200 ns | 400 ns   |
+| 1,000                 | 200 ns | 500 ns   |
+| 20,000                | 400 ns | 1,000 ns |
 
-| Percentile | Latency    |
-| ---------- | ---------- |
-| avg        | 161 ns     |
-| p50        | 126 ns     |
-| p90        | 190 ns     |
-| p99        | 319 ns     |
-| p99.9      | 3,769 ns   |
-| max        | 325,425 ns |
+p50 climbing from 200 ns at 21 levels to 400 ns at 20,000 is the `O(log L)` cost of the ordered-map lookup made visible (21 and 1,000 tie only because their ~6-comparison difference is under the 100 ns timer tick). The earlier fixed-array design was `O(1)` here — a deliberate trade for an uncapped price range and cheap L2 depth (see [Design & Architecture](#design--architecture)).
 
-**Crossing inserts (matched against book)** — n=43,668
+**Cancels** (intrusive-list unlink at a random queue position; n = 80,000)
 
-| Percentile | Latency   |
-| ---------- | --------- |
-| avg        | 166 ns    |
-| p50        | 137 ns    |
-| p90        | 287 ns    |
-| p99        | 456 ns    |
-| p99.9      | 743 ns    |
-| max        | 62,885 ns |
+| Percentile | Latency      |
+| ---------- | ------------ |
+| avg        | 546 ns       |
+| p50        | 400 ns       |
+| p90        | 600 ns       |
+| p99        | 900 ns       |
+| p99.9      | 2,300 ns     |
+| max        | 2,511,400 ns |
 
-> The max values are 100-1000x larger than p99.9, which points to OS scheduler jitter (context switches, page faults) rather than the matching engine itself — the p99.9 column is the more representative worst case for the algorithm's actual behavior.
+> The `max` is ~1000× the p99.9 — OS scheduler jitter (context switches, page faults), not the engine. The p99.9 column is the more representative worst case for the algorithm itself.
 
-> **Design note:** price levels are held in ordered `std::map`s, so lookup/insert/erase is `O(log L)` in the number of *distinct live price levels* `L` (typically small), not the earlier fixed-array `O(1)`. This trades a modest, measured latency cost (≈40 ns at the median) for an uncapped price range and correct, cheap L2 depth snapshots. The O(1) memory pool is unchanged.
-
-**Test Environment:** Ubuntu 24.04, Intel Xeon @ 2.80GHz, GCC 13.3, `std::chrono::steady_clock`.
+**Test Environment:** Windows 11, Intel Core i5-8365U @ 1.60GHz, GCC 6.3.0 (MinGW), `-O3`, `QueryPerformanceCounter` (~100 ns resolution).
 > Latency numbers are meaningless without hardware context — always report the machine a benchmark ran on.
 
 ## Design & Architecture
@@ -100,7 +92,7 @@ Each side of the book is an ordered `std::map` from price to price level — bid
 
 ## Key Optimizations
 
-**Zero-allocation execution.** A custom contiguous `MemoryPool<Order>` uses placement `new` to pre-allocate order objects, eliminating `malloc`/`free` calls — and the latency jitter they introduce — from the hot path. This alone accounted for a >50% latency improvement over naive heap allocation.
+**Pooled order allocation.** A custom `MemoryPool<Order>` serves `Order` objects from a pre-allocated block via placement `new`, keeping order construction off the general heap. This pools *orders only* — each resting order still allocates an `unordered_map` node (the ID index), and each new price level allocates a `PriceLevel` plus a `std::map` node. Measured on the benchmark workload that's roughly **1.1 `new` calls per order**: the pool removes the per-order `Order` allocation and its jitter, not all allocation.
 
 **Ordered price maps.** Bids and asks are ordered maps, so top-of-book is `begin()` (no scanning), depleted levels drop out cleanly, and L2 depth snapshots are a direct ordered walk. Level lookup is `O(log L)` in the number of live price levels — a deliberate trade against the previous fixed-array `O(1)` in exchange for an uncapped price range and correct, cheap depth queries.
 

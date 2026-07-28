@@ -1,7 +1,5 @@
 name: CI
 
-# Run on every branch push and every pull request, so feature branches are
-# validated before they reach main (not only pushes to main itself).
 on:
   push:
   pull_request:
@@ -12,17 +10,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Debug: no NDEBUG, no optimization masking. Primary correctness gate.
+      - name: Configure (Debug)
+        run: cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
+      - name: Build (Debug)
+        run: cmake --build build-debug -j
+      - name: Test (Debug)
+        run: ctest --test-dir build-debug --output-on-failure
+
+      # Release: proves the suite still passes with -O3 + NDEBUG, now that the
+      # checks use CHECK (never compiled out) instead of assert.
       - name: Configure (Release)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
+      - name: Build (Release)
         run: cmake --build build -j
-
-      - name: Test
+      - name: Test (Release)
         run: ctest --test-dir build --output-on-failure
 
+      # Sanitizers, explicitly Debug so ASan/UBSan aren't weakened by -O3/NDEBUG.
       - name: Configure & build with ASan/UBSan
-        run: cmake -S . -B build-san -DENABLE_SANITIZERS=ON && cmake --build build-san -j
-
+        run: cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON && cmake --build build-san -j
       - name: Test under ASan/UBSan
         run: ctest --test-dir build-san --output-on-failure

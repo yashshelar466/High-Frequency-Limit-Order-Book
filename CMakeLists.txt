@@ -35,6 +35,10 @@ target_link_libraries(run_tests PRIVATE orderbook)
 add_executable(run_diff tests/test_differential.cpp)
 target_link_libraries(run_diff PRIVATE orderbook)
 
+
+add_executable(run_pool tests/test_memorypool.cpp)
+target_link_libraries(run_pool PRIVATE orderbook)
+
 # The latency benchmark always wants aggressive optimization, independent of
 # the overall build type.
 add_executable(run_benchmark benchmarks/benchmark_latency.cpp)
@@ -46,3 +50,5 @@ target_compile_options(run_benchmark PRIVATE -O3)
 enable_testing()
 add_test(NAME unit COMMAND run_tests)
 add_test(NAME differential COMMAND run_diff)
+
+add_test(NAME memory_pool COMMAND run_pool)
