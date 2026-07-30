@@ -93,6 +93,92 @@ void bench_depth(uint32_t num_levels) {
               << " ns   p99=" << percentile(lat, 99) << " ns\n";
 }
 
+// A/B the pooled allocator against the general heap on the same access pattern.
+// The README used to claim a latency improvement from the memory pool with no
+// benchmark anywhere in the repo to support it; this is that benchmark. Both
+// arms run identical steady-state churn: hold LIVE orders, then repeatedly
+// release one and allocate a replacement, timing the release+allocate pair.
+// That is the shape an order book actually produces — a roughly constant
+// population with orders arriving and leaving — rather than one bulk
+// allocation, which would flatter the pool by measuring only free-list pops.
+template <typename Alloc, typename Free>
+std::vector<int64_t> churn(Alloc alloc, Free free_fn) {
+    constexpr int LIVE = 20000;
+    constexpr int OPS  = 100000;
+
+    std::vector<Order*> live;
+    live.reserve(LIVE);
+    for (int i = 0; i < LIVE; ++i)
+        live.push_back(alloc(static_cast<uint64_t>(i), 1000u + i % 512, 100u, true));
+
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<int> slot(0, LIVE - 1);
+
+    std::vector<int64_t> lat;
+    lat.reserve(OPS);
+    for (int i = 0; i < OPS; ++i) {
+        int s = slot(rng);                          // release from a random slot,
+        uint64_t id = static_cast<uint64_t>(LIVE + i);   // not strict LIFO
+        int64_t t1 = HighResTimer::now_ns();
+        free_fn(live[s]);
+        live[s] = alloc(id, 1000u + (i % 512), 100u, true);
+        int64_t t2 = HighResTimer::now_ns();
+        lat.push_back(t2 - t1);
+    }
+    for (Order* o : live) free_fn(o);
+    return lat;
+}
+
+void bench_allocator() {
+    // Pool capacity must exceed the live population, or every allocation spills
+    // to the heap and the two arms measure the same thing.
+    static MemoryPool<Order, 65536> pool;
+    auto pool_lat = churn(
+        [](uint64_t id, uint32_t p, uint32_t q, bool b) { return pool.allocate(id, p, q, b); },
+        [](Order* o) { pool.deallocate(o); });
+
+    auto heap_lat = churn(
+        [](uint64_t id, uint32_t p, uint32_t q, bool b) { return new Order(id, p, q, b); },
+        [](Order* o) { delete o; });
+
+    // If the pool ever spilled, the comparison is invalid — say so rather than
+    // reporting a number that silently measures the heap in both arms.
+    if (pool.has_overflowed())
+        std::cout << "  WARNING: pool overflowed (" << pool.overflow_total()
+                  << " spills) — A/B comparison is not meaningful\n";
+
+    print_stats("Order alloc+free churn -- MemoryPool", pool_lat);
+    print_stats("Order alloc+free churn -- global new/delete", heap_lat);
+}
+
+// The trade-reporting hook is a std::function, so every fill pays an indirect
+// call through a type-erased target that the compiler cannot inline. This
+// measures that cost directly: identical single-fill crossing inserts, with the
+// handler unset (null check only) and set (indirect call per fill).
+void bench_trade_handler(bool with_handler) {
+    constexpr int OPS = 50000;
+    OrderBook book;
+    uint64_t fills = 0;
+    if (with_handler)
+        book.set_trade_handler([&fills](const Trade&) { ++fills; });
+
+    std::vector<int64_t> lat;
+    lat.reserve(OPS);
+    uint64_t id = 1;
+    for (int i = 0; i < OPS; ++i) {
+        book.insert_order(id++, 1000, 100, /*is_buy=*/false);   // rest an ask (untimed)
+        int64_t t1 = HighResTimer::now_ns();
+        book.insert_order(id++, 1000, 100, /*is_buy=*/true);    // consumes it: exactly 1 fill
+        int64_t t2 = HighResTimer::now_ns();
+        lat.push_back(t2 - t1);
+    }
+    print_stats(with_handler ? "Crossing insert, 1 fill -- handler set (std::function)"
+                             : "Crossing insert, 1 fill -- handler unset (null check)",
+                lat);
+    if (with_handler && fills != OPS)          // guard: the arm must really fill
+        std::cout << "  WARNING: expected " << OPS << " fills, observed " << fills << "\n";
+}
+
 // The intrusive-list cancel path — the headline design decision, previously
 // unmeasured. Cancels hit random queue positions.
 void bench_cancel() {
@@ -130,6 +216,15 @@ int main() {
     std::cout << "\n";
 
     bench_cancel();
+    std::cout << "\n";
+
+    std::cout << "Allocator A/B (same churn pattern, pool vs. general heap):\n";
+    bench_allocator();
+    std::cout << "\n";
+
+    std::cout << "Trade-handler dispatch cost (std::function indirect call per fill):\n";
+    bench_trade_handler(false);
+    bench_trade_handler(true);
 
     std::cout << "=========================" << std::endl;
     return 0;

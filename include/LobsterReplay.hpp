@@ -21,6 +21,7 @@
 // tests/test_lobster_replay.cpp.
 
 #include "OrderBook.hpp"
+#include "FeatureEmit.hpp"
 
 #include <cstdint>
 #include <fstream>
@@ -347,10 +348,15 @@ inline void apply_message(OrderBook& book, const Message& m, Stats& st,
 //                     which measures the honest reconstruction horizon.
 //   true            — adopt unexplained published levels and keep going,
 //                     reporting how many adoptions the session required.
+// `sink`, when set, receives one FeatureRow per message — the reconstructed
+// book state that message produced. See FeatureEmit.hpp. Emission happens after
+// the message is applied and after any recover-mode resynchronisation, so the
+// features describe the same book the reconciliation just checked.
 inline bool replay_and_reconcile(const std::string& msg_path,
                                  const std::string& book_path,
                                  size_t levels, Stats& st, std::string& err,
-                                 bool recover = false) {
+                                 bool recover = false,
+                                 const FeatureSink& sink = FeatureSink{}) {
     std::ifstream msg_file(msg_path);
     if (!msg_file) { err = "cannot open " + msg_path; return false; }
     std::ifstream book_file(book_path);
@@ -368,6 +374,7 @@ inline bool replay_and_reconcile(const std::string& msg_path,
     std::vector<PubLevel> pub_asks, pub_bids;
     bool seeded = false;
     SeedIndex seeds;
+    OfiTracker ofi;
     // Synthetic ids stand in for orders we were never given real ids for. Kept
     // across the whole run so opening seeds and later recoveries never collide.
     uint64_t synthetic_id = 900000000000ULL;
@@ -470,6 +477,37 @@ inline bool replay_and_reconcile(const std::string& msg_path,
                 prune_phantom_levels(book, pub_asks, pub_bids, seeds, levels);
             st.recovered_levels +=
                 recover_missing_levels(book, pub_asks, pub_bids, seeds, synthetic_id);
+        }
+
+        // Emit the feature row for this update, before the comparison — so a
+        // strict-mode run that stops at a divergence still leaves a usable file
+        // covering everything it did reconcile.
+        if (sink) {
+            FeatureRow row;
+            row.msg_index = st.messages;
+            row.time = m.time;
+            row.event = m.event;
+            row.direction = m.direction;
+            row.msg_size = m.size;
+            row.msg_price = m.price;
+
+            auto bid_top = book.get_bid_depth(DEPTH_LEVELS);
+            auto ask_top = book.get_ask_depth(DEPTH_LEVELS);
+            if (!bid_top.empty()) { row.bid_px = bid_top[0].price; row.bid_sz = bid_top[0].volume; }
+            if (!ask_top.empty()) { row.ask_px = ask_top[0].price; row.ask_sz = ask_top[0].volume; }
+            for (const auto& l : bid_top) row.bid_depth_vol += l.volume;
+            for (const auto& l : ask_top) row.ask_depth_vol += l.volume;
+
+            bool valid = false;
+            row.ofi = ofi.update(row.bid_px, row.bid_sz, row.ask_px, row.ask_sz, valid);
+            row.quote_valid = valid ? 1 : 0;
+
+            if (static_cast<Event>(m.event) == Event::EXEC_VISIBLE)
+                row.signed_trade_sz = signed_execution_size(m.direction, m.size);
+            else if (static_cast<Event>(m.event) == Event::EXEC_HIDDEN)
+                row.signed_hidden_sz = signed_execution_size(m.direction, m.size);
+
+            sink(row);
         }
 
         // Compare only the requested window. The deepest published levels are

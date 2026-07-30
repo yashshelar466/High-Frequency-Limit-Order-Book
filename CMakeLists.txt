@@ -48,6 +48,10 @@ target_link_libraries(run_lobster PRIVATE orderbook)
 add_executable(run_lobster_test tests/test_lobster_replay.cpp)
 target_link_libraries(run_lobster_test PRIVATE orderbook)
 
+# Feature emitter for the microstructure study in research/.
+add_executable(run_feature_test tests/test_features.cpp)
+target_link_libraries(run_feature_test PRIVATE orderbook)
+
 # The latency benchmark always wants aggressive optimization, independent of
 # the overall build type.
 add_executable(run_benchmark benchmarks/benchmark_latency.cpp)
@@ -63,3 +67,5 @@ add_test(NAME differential COMMAND run_diff)
 add_test(NAME memory_pool COMMAND run_pool)
 
 add_test(NAME lobster_replay COMMAND run_lobster_test)
+
+add_test(NAME features COMMAND run_feature_test)

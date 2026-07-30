@@ -80,3 +80,18 @@ Testing/
 book_test
 *.o
 *.obj
+
+# Test fixtures written by the test binaries at runtime
+feat_*.csv
+lobster_fixture_*.csv
+lobster_warm_*.csv
+
+# Generated research artifacts (regenerate: research/ofi_study.ipynb or make_synthetic_lobster.py)
+data/features_*.csv
+data/SYNTH_*
+data/CI_*
+research/.ipynb_checkpoints/
+
+# Python bytecode
+__pycache__/
+*.pyc

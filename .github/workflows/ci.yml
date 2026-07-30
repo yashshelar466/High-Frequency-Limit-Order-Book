@@ -32,3 +32,25 @@ jobs:
         run: cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON && cmake --build build-san -j
       - name: Test under ASan/UBSan
         run: ctest --test-dir build-san --output-on-failure
+
+      # The research analysis code (research/) gets the same treatment as the
+      # engine: a bug in the statistics doesn't crash, it produces a
+      # plausible wrong answer, so it is guarded here too.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install analysis dependencies
+        run: python -m pip install --quiet numpy pandas
+      - name: Test the analysis library
+        run: python research/test_ofi_lib.py
+
+      # End-to-end: generate LOBSTER-format data from an independently written
+      # order book, replay it through the engine, and require a strict
+      # reconciliation. Two separate implementations must agree exactly.
+      - name: Feature pipeline end-to-end
+        run: |
+          python research/make_synthetic_lobster.py --mode impact --messages 5000 \
+              --seed 7 --out-prefix data/CI
+          ./build/run_lobster data/CI_message_5.csv data/CI_orderbook_5.csv 5 \
+              --emit-features data/CI_features.csv
