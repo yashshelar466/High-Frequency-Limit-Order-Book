@@ -171,6 +171,40 @@ void test_attributes_unknown_id_to_seeded_liquidity() {
     std::cout << "[PASS] LOBSTER Replay Attributes Unknown ID To Seeded Liquidity Test" << std::endl;
 }
 
+void test_seeds_full_depth_when_comparing_shallower() {
+    // Reproduces a real failure from AAPL 2012-06-21 at reconcile-depth 5:
+    // seeding only the compared depth throws away published liquidity below
+    // it, so when the top of book is consumed, a level that should promote
+    // into view is simply missing from our book. Seeding must use the file's
+    // FULL published depth even when the comparison window is shallower.
+    //
+    // Here the file publishes 2 levels but we reconcile only 1. Deleting the
+    // best bid must promote the second level — which only exists in our book
+    // if it was seeded despite being outside the comparison window.
+    std::vector<std::string> messages = {
+        "34200.0,1,500,10,5850000,1",        // msg 1: our order, becomes best bid
+        "34200.1,3,500,10,5850000,1",        // msg 2: delete it; level 2 promotes
+    };
+    std::vector<std::string> rows = {
+        book_row({{5851000, 100}, {5852000, 50}}, {{5850000, 10}, {5849000, 200}}),
+        book_row({{5851000, 100}, {5852000, 50}}, {{5849000, 200}}),
+    };
+    write_file("lobster_depth_message.csv", messages);
+    write_file("lobster_depth_orderbook.csv", rows);
+
+    lobster::Stats st;
+    std::string err;
+    bool ok = lobster::replay_and_reconcile(
+        "lobster_depth_message.csv", "lobster_depth_orderbook.csv",
+        /*levels=*/1, st, err);   // compare 1 level, file publishes 2
+
+    if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
+    CHECK(ok);
+    CHECK(st.messages == 2);
+
+    std::cout << "[PASS] LOBSTER Replay Seeds Full Depth When Comparing Shallower Test" << std::endl;
+}
+
 void test_detects_corrupted_book() {
     Fixture fx = build_fixture();
     // Corrupt one published size mid-stream. A reconciler that actually
@@ -215,6 +249,7 @@ void cleanup() {
     for (const char* f : {"lobster_fixture_message.csv", "lobster_fixture_orderbook.csv",
                           "lobster_warm_message.csv", "lobster_warm_orderbook.csv",
                           "lobster_seedref_message.csv", "lobster_seedref_orderbook.csv",
+                          "lobster_depth_message.csv", "lobster_depth_orderbook.csv",
                           "lobster_bad_message.csv", "lobster_bad_orderbook.csv",
                           "lobster_drop_message.csv", "lobster_drop_orderbook.csv"}) {
         std::remove(f);
@@ -228,6 +263,7 @@ int main() {
     test_reconciles_clean_stream();
     test_reconciles_preexisting_opening_liquidity();
     test_attributes_unknown_id_to_seeded_liquidity();
+    test_seeds_full_depth_when_comparing_shallower();
     test_detects_corrupted_book();
     test_detects_dropped_message();
     cleanup();

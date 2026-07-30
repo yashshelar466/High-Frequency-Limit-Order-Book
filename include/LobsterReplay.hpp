@@ -267,7 +267,20 @@ inline bool replay_and_reconcile(const std::string& msg_path,
             return false;
         }
 
-        if (!parse_book_row(book_line, levels, pub_asks, pub_bids)) {
+        // Parse the row at the file's FULL published depth, not just the depth
+        // we intend to compare. Seeding must use everything the venue tells us
+        // about the opening book — liquidity at levels below the comparison
+        // window still promotes into view as the top is consumed, and throwing
+        // it away guarantees a divergence later. The comparison itself is
+        // narrowed to `levels` further down.
+        const size_t file_levels = split_csv(book_line).size() / 4;
+        if (file_levels < levels) {
+            err = "orderbook row at line " + std::to_string(st.messages) +
+                  " has only " + std::to_string(file_levels) +
+                  " levels, fewer than the " + std::to_string(levels) + " requested";
+            return false;
+        }
+        if (!parse_book_row(book_line, file_levels, pub_asks, pub_bids)) {
             err = "malformed orderbook row at line " + std::to_string(st.messages);
             return false;
         }
@@ -327,9 +340,16 @@ inline bool replay_and_reconcile(const std::string& msg_path,
 
         apply_message(book, m, st, seeds);
 
+        // Compare only the requested window. The deepest published levels are
+        // structurally unreliable (see the depth-window note in the README), so
+        // reconciling shallower than you ingest keeps the check inside the
+        // region the message stream can actually account for.
+        std::vector<PubLevel> cmp_asks(pub_asks.begin(), pub_asks.begin() + levels);
+        std::vector<PubLevel> cmp_bids(pub_bids.begin(), pub_bids.begin() + levels);
+
         std::string side_err;
-        if (!compare_side(book.get_ask_depth(levels), pub_asks, "ask", side_err) ||
-            !compare_side(book.get_bid_depth(levels), pub_bids, "bid", side_err)) {
+        if (!compare_side(book.get_ask_depth(levels), cmp_asks, "ask", side_err) ||
+            !compare_side(book.get_bid_depth(levels), cmp_bids, "bid", side_err)) {
             err = "divergence at message " + std::to_string(st.messages) +
                   " (event=" + std::to_string(m.event) +
                   " id=" + std::to_string(m.order_id) +
