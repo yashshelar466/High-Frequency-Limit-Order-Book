@@ -36,6 +36,8 @@ int main(int argc, char** argv) {
               << " book with zero divergences.\n"
               << "  skipped: " << st.skipped_hidden << " hidden executions, "
               << st.skipped_cross << " cross, " << st.skipped_halt << " halt\n"
+              << "  events attributed to seeded pre-window liquidity: "
+              << st.seed_attributed << "\n"
               << "  references to orders not present in the file: "
               << st.unknown_refs << "\n";
     return 0;

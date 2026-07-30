@@ -67,8 +67,16 @@ struct Stats {
     uint64_t skipped_cross = 0;
     uint64_t skipped_halt = 0;
     uint64_t unknown_refs = 0;      // delete/execute naming an order we never saw
+    uint64_t seed_attributed = 0;   // unknown id resolved against seeded liquidity
     uint64_t unexpected_trades = 0; // engine matched — should never happen
 };
+
+// Seeded pre-existing liquidity, keyed by (is_buy, price) -> synthetic order id.
+// Orders resting before the capture window have real exchange IDs we cannot
+// know, so we stand in for them with synthetic IDs; this index lets a later
+// message that references one of those real IDs still be attributed to the
+// right aggregate. See attribute_to_seed().
+using SeedIndex = std::map<std::pair<bool, uint32_t>, uint64_t>;
 
 inline std::vector<std::string> split_csv(const std::string& line) {
     std::vector<std::string> out;
@@ -147,7 +155,34 @@ inline bool compare_side(const std::vector<DepthLevel>& ours,
 }
 
 // Apply one LOBSTER message to the book.
-inline void apply_message(OrderBook& book, const Message& m, Stats& st) {
+// Handle a delete/execution whose order id we don't hold.
+//
+// Orders resting before the capture window were seeded under synthetic ids, so
+// a later message referencing one by its real exchange id finds nothing. But
+// the venue is still telling us something true and specific: "`size` shares
+// left this price on this side." When we hold seeded liquidity at exactly that
+// (side, price), attributing the reduction to it keeps the aggregate book — the
+// thing an L2 reconciliation actually compares — correct, even though the
+// order-level identity is unrecoverable.
+//
+// Returns true if the event was attributed to seeded liquidity.
+inline bool attribute_to_seed(OrderBook& book, const Message& m,
+                              SeedIndex& seeds, Stats& st) {
+    auto key = std::make_pair(m.direction == 1, m.price);
+    auto it = seeds.find(key);
+    if (it == seeds.end()) return false;
+
+    uint32_t held = book.get_order_qty(it->second);
+    if (held == 0) { seeds.erase(it); return false; }   // seeded order already gone
+
+    book.reduce_order(it->second, m.size);
+    ++st.seed_attributed;
+    if (book.get_order_qty(it->second) == 0) seeds.erase(it);
+    return true;
+}
+
+inline void apply_message(OrderBook& book, const Message& m, Stats& st,
+                          SeedIndex& seeds) {
     switch (static_cast<Event>(m.event)) {
         case Event::NEW_LIMIT:
             // LOBSTER's stream is already matched, so a new limit order never
@@ -160,13 +195,21 @@ inline void apply_message(OrderBook& book, const Message& m, Stats& st) {
             // Both shrink a specific resting order by `size`. Executions are
             // pre-matched by the venue, so we apply them as reductions rather
             // than letting our engine match.
-            if (book.get_order_qty(m.order_id) == 0) ++st.unknown_refs;
-            book.reduce_order(m.order_id, m.size);
+            if (book.get_order_qty(m.order_id) == 0) {
+                if (!attribute_to_seed(book, m, seeds, st)) ++st.unknown_refs;
+            } else {
+                book.reduce_order(m.order_id, m.size);
+            }
             break;
 
         case Event::FULL_DELETE:
-            if (book.get_order_qty(m.order_id) == 0) ++st.unknown_refs;
-            book.cancel_order(m.order_id);
+            // LOBSTER reports the order's full size on a delete, so an
+            // unattributable delete reduces the seeded aggregate by that much.
+            if (book.get_order_qty(m.order_id) == 0) {
+                if (!attribute_to_seed(book, m, seeds, st)) ++st.unknown_refs;
+            } else {
+                book.cancel_order(m.order_id);
+            }
             break;
 
         case Event::EXEC_HIDDEN:
@@ -203,6 +246,7 @@ inline bool replay_and_reconcile(const std::string& msg_path,
     std::string msg_line, book_line;
     std::vector<PubLevel> pub_asks, pub_bids;
     bool seeded = false;
+    SeedIndex seeds;
 
     while (std::getline(msg_file, msg_line)) {
         if (msg_line.empty()) continue;
@@ -266,18 +310,22 @@ inline bool replay_and_reconcile(const std::string& msg_path,
                 }
             }
             uint64_t synthetic_id = 900000000000ULL;
-            for (const auto& lvl : seed_bids)
-                if (lvl.present)
-                    book.insert_order(synthetic_id++, static_cast<uint32_t>(lvl.price),
-                                      static_cast<uint32_t>(lvl.size), true);
-            for (const auto& lvl : seed_asks)
-                if (lvl.present)
-                    book.insert_order(synthetic_id++, static_cast<uint32_t>(lvl.price),
-                                      static_cast<uint32_t>(lvl.size), false);
+            for (const auto& lvl : seed_bids) {
+                if (!lvl.present) continue;
+                uint32_t px = static_cast<uint32_t>(lvl.price);
+                book.insert_order(synthetic_id, px, static_cast<uint32_t>(lvl.size), true);
+                seeds[{true, px}] = synthetic_id++;
+            }
+            for (const auto& lvl : seed_asks) {
+                if (!lvl.present) continue;
+                uint32_t px = static_cast<uint32_t>(lvl.price);
+                book.insert_order(synthetic_id, px, static_cast<uint32_t>(lvl.size), false);
+                seeds[{false, px}] = synthetic_id++;
+            }
             seeded = true;
         }
 
-        apply_message(book, m, st);
+        apply_message(book, m, st, seeds);
 
         std::string side_err;
         if (!compare_side(book.get_ask_depth(levels), pub_asks, "ask", side_err) ||
