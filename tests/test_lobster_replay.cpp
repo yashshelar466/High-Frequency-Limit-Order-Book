@@ -205,6 +205,82 @@ void test_seeds_full_depth_when_comparing_shallower() {
     std::cout << "[PASS] LOBSTER Replay Seeds Full Depth When Comparing Shallower Test" << std::endl;
 }
 
+// A published book containing a level no message ever created — the shape that
+// ended every strict run on AAPL 2012-06-21 (order 13419503, 50 @ 5854000,
+// which appears in the venue's book with no submission anywhere in the file).
+// A top-N feed omits events outside its price window, so liquidity resting
+// below the window surfaces unannounced once the levels above it clear.
+Fixture build_unannounced_level_fixture() {
+    Fixture fx;
+    // Msg 1 establishes a book we can fully explain.
+    fx.messages.push_back("34200.0,1,500,10,5850000,1");
+    fx.book.push_back(book_row({{5851000, 100}}, {{5850000, 10}}));
+    // Msg 2 deletes it — and the venue reveals a bid at 5849000 x 200 that no
+    // message in this file ever created.
+    fx.messages.push_back("34200.1,3,500,10,5850000,1");
+    fx.book.push_back(book_row({{5851000, 100}}, {{5849000, 200}}));
+    return fx;
+}
+
+void test_strict_mode_stops_at_unannounced_level() {
+    Fixture fx = build_unannounced_level_fixture();
+    write_file("lobster_unann_message.csv", fx.messages);
+    write_file("lobster_unann_orderbook.csv", fx.book);
+
+    lobster::Stats st;
+    std::string err;
+    bool ok = lobster::replay_and_reconcile(
+        "lobster_unann_message.csv", "lobster_unann_orderbook.csv",
+        LEVELS, st, err, /*recover=*/false);
+
+    CHECK(!ok);                 // strict mode reports the horizon rather than guessing
+    CHECK(st.messages == 2);
+    CHECK(st.recovered_levels == 0);
+
+    std::cout << "[PASS] LOBSTER Replay Strict Mode Stops At Unannounced Level Test" << std::endl;
+}
+
+void test_recover_mode_adopts_unannounced_level() {
+    Fixture fx = build_unannounced_level_fixture();
+    write_file("lobster_rec_message.csv", fx.messages);
+    write_file("lobster_rec_orderbook.csv", fx.book);
+
+    lobster::Stats st;
+    std::string err;
+    bool ok = lobster::replay_and_reconcile(
+        "lobster_rec_message.csv", "lobster_rec_orderbook.csv",
+        LEVELS, st, err, /*recover=*/true);
+
+    if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
+    CHECK(ok);                          // same data now reconciles end to end
+    CHECK(st.messages == 2);
+    CHECK(st.recovered_levels == 1);    // and the adoption is counted, not hidden
+
+    std::cout << "[PASS] LOBSTER Replay Recover Mode Adopts Unannounced Level Test" << std::endl;
+}
+
+void test_recover_mode_still_detects_size_mismatch() {
+    // Recover mode must only forgive levels that are *missing*. A level we do
+    // track whose size disagrees with the venue is a genuine reconstruction
+    // error and must still fail — otherwise "recover" would just mean "never
+    // report anything", which is the same trap as assertions that compile out.
+    Fixture fx = build_fixture();
+    fx.book[5] = book_row({{5850000, 41}, {5851000, 50}}, {{5849000, 350}});
+    write_file("lobster_recbad_message.csv", fx.messages);
+    write_file("lobster_recbad_orderbook.csv", fx.book);
+
+    lobster::Stats st;
+    std::string err;
+    bool ok = lobster::replay_and_reconcile(
+        "lobster_recbad_message.csv", "lobster_recbad_orderbook.csv",
+        LEVELS, st, err, /*recover=*/true);
+
+    CHECK(!ok);
+    CHECK(err.find("divergence") != std::string::npos);
+
+    std::cout << "[PASS] LOBSTER Replay Recover Mode Still Detects Size Mismatch Test" << std::endl;
+}
+
 void test_detects_corrupted_book() {
     Fixture fx = build_fixture();
     // Corrupt one published size mid-stream. A reconciler that actually
@@ -250,6 +326,9 @@ void cleanup() {
                           "lobster_warm_message.csv", "lobster_warm_orderbook.csv",
                           "lobster_seedref_message.csv", "lobster_seedref_orderbook.csv",
                           "lobster_depth_message.csv", "lobster_depth_orderbook.csv",
+                          "lobster_unann_message.csv", "lobster_unann_orderbook.csv",
+                          "lobster_rec_message.csv", "lobster_rec_orderbook.csv",
+                          "lobster_recbad_message.csv", "lobster_recbad_orderbook.csv",
                           "lobster_bad_message.csv", "lobster_bad_orderbook.csv",
                           "lobster_drop_message.csv", "lobster_drop_orderbook.csv"}) {
         std::remove(f);
@@ -264,6 +343,9 @@ int main() {
     test_reconciles_preexisting_opening_liquidity();
     test_attributes_unknown_id_to_seeded_liquidity();
     test_seeds_full_depth_when_comparing_shallower();
+    test_strict_mode_stops_at_unannounced_level();
+    test_recover_mode_adopts_unannounced_level();
+    test_recover_mode_still_detects_size_mismatch();
     test_detects_corrupted_book();
     test_detects_dropped_message();
     cleanup();

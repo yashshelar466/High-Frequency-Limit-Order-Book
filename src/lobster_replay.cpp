@@ -13,32 +13,62 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
+    std::vector<std::string> positional;
+    bool recover = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--recover") recover = true;
+        else positional.push_back(a);
+    }
+
+    if (positional.size() < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <message.csv> <orderbook.csv> [levels]\n";
+                  << " <message.csv> <orderbook.csv> [levels] [--recover]\n"
+                     "\n"
+                     "  Strict (default): stop at the first published level the\n"
+                     "  message stream cannot explain, reporting how far the book\n"
+                     "  reconstructed exactly.\n"
+                     "\n"
+                     "  --recover: adopt unexplained levels and continue, reporting\n"
+                     "  how many adoptions the session needed. A top-N feed omits\n"
+                     "  events outside its price window, so such levels can appear\n"
+                     "  unannounced; size mismatches and phantom levels still fail.\n";
         return 2;
     }
-    const std::string msg_path = argv[1];
-    const std::string book_path = argv[2];
-    const size_t levels = (argc > 3) ? static_cast<size_t>(std::stoul(argv[3])) : 10;
+    const std::string msg_path = positional[0];
+    const std::string book_path = positional[1];
+    const size_t levels = (positional.size() > 2)
+                              ? static_cast<size_t>(std::stoul(positional[2])) : 10;
 
     lobster::Stats st;
     std::string err;
-    if (!lobster::replay_and_reconcile(msg_path, book_path, levels, st, err)) {
+    if (!lobster::replay_and_reconcile(msg_path, book_path, levels, st, err, recover)) {
         std::cerr << "FAILED after " << st.messages << " messages: " << err << "\n";
+        if (!recover) {
+            std::cerr << "\nStrict reconstruction horizon: " << st.messages
+                      << " messages at depth " << levels
+                      << ". Re-run with --recover to continue past unexplained"
+                         " levels and count them.\n";
+        }
         return 1;
     }
 
     std::cout << "Reconciled " << st.messages
               << " messages against LOBSTER's published top-" << levels
-              << " book with zero divergences.\n"
+              << " book with zero divergences"
+              << (recover ? " (recover mode).\n" : " (strict mode).\n")
               << "  skipped: " << st.skipped_hidden << " hidden executions, "
               << st.skipped_cross << " cross, " << st.skipped_halt << " halt\n"
               << "  events attributed to seeded pre-window liquidity: "
               << st.seed_attributed << "\n"
               << "  references to orders not present in the file: "
               << st.unknown_refs << "\n";
+    if (recover) {
+        std::cout << "  unexplained levels adopted from the published book: "
+                  << st.recovered_levels << "\n";
+    }
     return 0;
 }

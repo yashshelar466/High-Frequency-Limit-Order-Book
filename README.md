@@ -168,8 +168,13 @@ The randomized differential test checks the engine against a reference model I w
 
 ```bash
 # Download a free sample day from lobsterdata.com into data/ (not redistributed here)
+# Strict: report the exact reconstruction horizon
 ./build/run_lobster data/AAPL_2012-06-21_34200000_57600000_message_10.csv \
                     data/AAPL_2012-06-21_34200000_57600000_orderbook_10.csv 10
+
+# Recover: continue past unexplained levels, counting each adoption
+./build/run_lobster data/AAPL_2012-06-21_34200000_57600000_message_10.csv \
+                    data/AAPL_2012-06-21_34200000_57600000_orderbook_10.csv 10 --recover
 ```
 
 How the events map onto the engine (per LOBSTER's documented message types — this format version documents 1, 2, 3, 4, 5, 7; type 6 is handled defensively in case a newer LOBSTER release emits it, though it never appears in the sample used here):
@@ -188,6 +193,23 @@ Two details worth calling out. First, executions are applied as **reductions rat
 **The book isn't empty when the message stream starts, and the reconciler accounts for that.** Replaying an actual NASDAQ session (AAPL, 2012-06-21) against its own published book failed immediately at message 1: the venue's first row already showed a fully populated ask ladder and several bid levels beyond message 1's own order — real resting liquidity established by the opening cross, with no "new order" message for it anywhere in the file, since the capture window begins exactly at market open. Both LOBSTER's own reconstruction and a naive from-empty replay hit this. The fix: infer the implied state strictly *before* message 1 by reversing its own contribution out of the published first row, then seed everything that's left — pre-existing liquidity with no message provenance in this file — as resting orders under synthetic order IDs clearly out of range of any real LOBSTER ID. Message 1 is then applied for real through the normal path, and the seeded book matches the published row exactly. This is validated by a dedicated test (`tests/test_lobster_replay.cpp`) that reproduces the shape at small scale, independent of the real data.
 
 **Later messages can still reference that seeded liquidity, and it's handled.** Replaying further surfaced the next problem: a delete at message 58 named order id `15836282` — far older than any id in the file, i.e. an order resting before the window and therefore seeded under a synthetic id. The id lookup finds nothing, so the reduction was being dropped and the level drifted 100 shares high. The fix is to fall back on what the venue *is* telling us: an unresolvable delete or execution at a (side, price) where we hold seeded liquidity is attributed to that seeded aggregate. Order-level identity is unrecoverable, but the aggregate book — the thing an L2 reconciliation actually compares — stays correct. Runs report this as `events attributed to seeded pre-window liquidity`, distinct from genuinely unresolvable `unknown_refs`.
+
+**Two ways to read the result: strict horizon, or recover-and-count.** Because a top-N feed is a windowed view rather than a complete event stream (see below), perfect from-scratch reconstruction of a full session is impossible *in principle* from level-10 data. `run_lobster` therefore supports both honest readings:
+
+- **Strict (default)** — stop at the first published level the message stream cannot explain, and report how far the book reconstructed *exactly*. This measures the reconstruction horizon.
+- **`--recover`** — adopt unexplained levels the way a production feed handler treats a detected gap, and report how many adoptions the session required. Size mismatches on tracked levels, invented prices, and phantom levels of our own **still fail** — recover mode only forgives levels that are missing, and a test asserts exactly that so "recover" can never quietly degrade into "never report anything."
+
+Measured strict horizons on AAPL 2012-06-21, which show the effect clearly:
+
+| Compare depth | Messages reconciled exactly |
+| ------------- | --------------------------- |
+| 1 (top of book) | 441 |
+| 2 | 226 |
+| 3 | 160 |
+| 5 | 156 |
+| 10 | 13 |
+
+Monotonic, and for one reason: every one of those runs ends on the *same* phantom level — order `13419503`, 50 shares at `5854000`, which sits in the venue's published book with no submission message anywhere in the file. The comparison depth only determines how long it takes that level to climb into the window being checked.
 
 **The remaining known limit — the depth window.** LOBSTER emits messages only for events *"in the requested price range"* (its readme). Liquidity that drifts below level N as better prices arrive can then be cancelled or executed **entirely outside the window, generating no message at all**, while a deeper level silently promotes into view in the published book. Tracing rows 12→13 of the AAPL session shows exactly this: `5876500 x 1160` vanishes from the venue's book with no corresponding message, and `5879000 x 500` appears at level 10 from outside the window. No reconstruction can recover events it was never told about, so the **deepest levels are structurally unreliable** and divergence there is expected rather than a bug. Reconciling a shallower window than you ingest (e.g. `run_lobster ... 5` against level-10 data) keeps the comparison inside the region the message stream can actually explain. Note that seeding always uses the file's **full** published depth even when the comparison is narrowed — liquidity below the comparison window still promotes into view as the top is consumed, so discarding it just guarantees a later divergence.
 

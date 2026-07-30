@@ -68,6 +68,7 @@ struct Stats {
     uint64_t skipped_halt = 0;
     uint64_t unknown_refs = 0;      // delete/execute naming an order we never saw
     uint64_t seed_attributed = 0;   // unknown id resolved against seeded liquidity
+    uint64_t recovered_levels = 0;  // published levels adopted in recover mode
     uint64_t unexpected_trades = 0; // engine matched — should never happen
 };
 
@@ -181,6 +182,49 @@ inline bool attribute_to_seed(OrderBook& book, const Message& m,
     return true;
 }
 
+// Adopt published levels we hold no liquidity at ("recover" mode).
+//
+// A top-N feed is a windowed view, not a complete event stream: LOBSTER emits
+// messages only for events in the requested price range, so an order resting
+// outside that window generates no message and then simply *appears* in the
+// published book once the levels above it are consumed. No amount of care with
+// the message stream can conjure liquidity it was never told about.
+//
+// Recover mode treats such a level the way a production feed handler treats a
+// detected gap — adopt what the venue reports and carry on — while counting
+// every adoption so the result stays honest. It only forgives levels that are
+// *missing* on our side: a size mismatch on a level we do track, a price we
+// invented, or a phantom of our own still fails the reconciliation.
+//
+// Levels that would cross our book are deliberately left alone: that indicates
+// a phantom on the opposite side, which is a genuine defect worth surfacing
+// rather than papering over.
+inline size_t recover_missing_levels(OrderBook& book,
+                                     const std::vector<PubLevel>& pub_asks,
+                                     const std::vector<PubLevel>& pub_bids,
+                                     SeedIndex& seeds, uint64_t& next_synthetic) {
+    size_t recovered = 0;
+    for (const auto& lvl : pub_bids) {
+        if (!lvl.present) continue;
+        uint32_t px = static_cast<uint32_t>(lvl.price);
+        if (book.get_bid_level(px) != nullptr) continue;      // already tracked
+        if (px >= book.get_best_ask()) continue;              // would cross — surface it
+        book.insert_order(next_synthetic, px, static_cast<uint32_t>(lvl.size), true);
+        seeds[{true, px}] = next_synthetic++;
+        ++recovered;
+    }
+    for (const auto& lvl : pub_asks) {
+        if (!lvl.present) continue;
+        uint32_t px = static_cast<uint32_t>(lvl.price);
+        if (book.get_ask_level(px) != nullptr) continue;
+        if (px <= book.get_best_bid()) continue;              // would cross — surface it
+        book.insert_order(next_synthetic, px, static_cast<uint32_t>(lvl.size), false);
+        seeds[{false, px}] = next_synthetic++;
+        ++recovered;
+    }
+    return recovered;
+}
+
 inline void apply_message(OrderBook& book, const Message& m, Stats& st,
                           SeedIndex& seeds) {
     switch (static_cast<Event>(m.event)) {
@@ -227,9 +271,15 @@ inline void apply_message(OrderBook& book, const Message& m, Stats& st,
 // Replay `msg_path` through a fresh book, reconciling against `book_path` after
 // every message. Returns true if the whole file reconciled; on failure `err`
 // describes the first divergence.
+// `recover` selects the two useful ways to read this data:
+//   false (default) — strict. The first level we cannot explain fails the run,
+//                     which measures the honest reconstruction horizon.
+//   true            — adopt unexplained published levels and keep going,
+//                     reporting how many adoptions the session required.
 inline bool replay_and_reconcile(const std::string& msg_path,
                                  const std::string& book_path,
-                                 size_t levels, Stats& st, std::string& err) {
+                                 size_t levels, Stats& st, std::string& err,
+                                 bool recover = false) {
     std::ifstream msg_file(msg_path);
     if (!msg_file) { err = "cannot open " + msg_path; return false; }
     std::ifstream book_file(book_path);
@@ -247,6 +297,9 @@ inline bool replay_and_reconcile(const std::string& msg_path,
     std::vector<PubLevel> pub_asks, pub_bids;
     bool seeded = false;
     SeedIndex seeds;
+    // Synthetic ids stand in for orders we were never given real ids for. Kept
+    // across the whole run so opening seeds and later recoveries never collide.
+    uint64_t synthetic_id = 900000000000ULL;
 
     while (std::getline(msg_file, msg_line)) {
         if (msg_line.empty()) continue;
@@ -322,7 +375,6 @@ inline bool replay_and_reconcile(const std::string& msg_path,
                     }
                 }
             }
-            uint64_t synthetic_id = 900000000000ULL;
             for (const auto& lvl : seed_bids) {
                 if (!lvl.present) continue;
                 uint32_t px = static_cast<uint32_t>(lvl.price);
@@ -339,6 +391,13 @@ inline bool replay_and_reconcile(const std::string& msg_path,
         }
 
         apply_message(book, m, st, seeds);
+
+        // In recover mode, adopt any published level we hold nothing at before
+        // comparing — a windowed feed can surface liquidity it never announced.
+        if (recover) {
+            st.recovered_levels +=
+                recover_missing_levels(book, pub_asks, pub_bids, seeds, synthetic_id);
+        }
 
         // Compare only the requested window. The deepest published levels are
         // structurally unreliable (see the depth-window note in the README), so
