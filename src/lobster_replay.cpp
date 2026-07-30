@@ -11,6 +11,7 @@
 
 #include "../include/LobsterReplay.hpp"
 
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,15 +19,26 @@
 int main(int argc, char** argv) {
     std::vector<std::string> positional;
     bool recover = false;
+    std::string features_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--recover") recover = true;
-        else positional.push_back(a);
+        if (a == "--recover") {
+            recover = true;
+        } else if (a == "--emit-features") {
+            if (i + 1 >= argc) {
+                std::cerr << "--emit-features needs an output path\n";
+                return 2;
+            }
+            features_path = argv[++i];
+        } else {
+            positional.push_back(a);
+        }
     }
 
     if (positional.size() < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <message.csv> <orderbook.csv> [levels] [--recover]\n"
+                  << " <message.csv> <orderbook.csv> [levels] [--recover]"
+                     " [--emit-features <out.csv>]\n"
                      "\n"
                      "  Strict (default): stop at the first published level the\n"
                      "  message stream cannot explain, reporting how far the book\n"
@@ -35,7 +47,13 @@ int main(int argc, char** argv) {
                      "  --recover: adopt unexplained levels and continue, reporting\n"
                      "  how many adoptions the session needed. A top-N feed omits\n"
                      "  events outside its price window, so such levels can appear\n"
-                     "  unannounced; size mismatches and phantom levels still fail.\n";
+                     "  unannounced; size mismatches and phantom levels still fail.\n"
+                     "\n"
+                     "  --emit-features: write one row per message describing the\n"
+                     "  reconstructed book (top of book, depth, OFI, signed trade\n"
+                     "  flow) for downstream analysis — see research/. Pair it with\n"
+                     "  --recover to cover a full session; in strict mode the file\n"
+                     "  stops where the reconciliation does.\n";
         return 2;
     }
     const std::string msg_path = positional[0];
@@ -45,7 +63,32 @@ int main(int argc, char** argv) {
 
     lobster::Stats st;
     std::string err;
-    if (!lobster::replay_and_reconcile(msg_path, book_path, levels, st, err, recover)) {
+
+    std::ofstream features;
+    lobster::FeatureSink sink;
+    uint64_t rows_written = 0;
+    if (!features_path.empty()) {
+        features.open(features_path);
+        if (!features) {
+            std::cerr << "cannot open " << features_path << " for writing\n";
+            return 2;
+        }
+        features << lobster::feature_csv_header() << '\n';
+        sink = [&](const lobster::FeatureRow& r) {
+            lobster::write_feature_csv(features, r);
+            ++rows_written;
+        };
+    }
+
+    const bool ok = lobster::replay_and_reconcile(msg_path, book_path, levels,
+                                                  st, err, recover, sink);
+    if (sink) {
+        features.flush();
+        std::cout << "Wrote " << rows_written << " feature rows to "
+                  << features_path << "\n";
+    }
+
+    if (!ok) {
         std::cerr << "FAILED after " << st.messages << " messages: " << err << "\n";
         if (!recover) {
             std::cerr << "\nStrict reconstruction horizon: " << st.messages

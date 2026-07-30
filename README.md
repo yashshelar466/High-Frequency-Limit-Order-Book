@@ -12,6 +12,7 @@ The claim this project makes is not "fastest." It is: *the matching logic is ver
 - [Overview](#overview)
 - [Correctness](#correctness)
 - [Real Market-Data Reconciliation (LOBSTER)](#real-market-data-reconciliation-lobster)
+- [Research: Does Order Flow Predict Price?](#research-does-order-flow-predict-price)
 - [Performance](#performance)
 - [Design & Architecture](#design--architecture)
 - [Key Optimizations](#key-optimizations)
@@ -32,6 +33,11 @@ A matching engine that is fast and wrong is worthless, so this is the part of th
 
 - **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, top-of-book reset after a level is emptied, amend/cancel-replace priority semantics, IOC/FOK/MARKET handling, and L2 depth snapshots (including empty and one-sided books).
 - **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random operations — LIMIT / IOC / FOK / MARKET inserts, cancels, amends, duplicate-ID attempts, and crossings — at both the production engine and a deliberately simple `std::map`-based reference model, checking they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
+- **Feature emitter test** (`tests/test_features.cpp`) checks the research feature path, where a
+  bug produces not a crash but a plausible wrong answer. Every expected OFI increment is worked
+  out by hand from the definition rather than recorded from a previous run, and the two sign
+  conventions that are easy to invert — the OFI increment, and LOBSTER's execution `Direction`
+  naming the *resting* order's side rather than the aggressor's — are asserted directly.
 - **LOBSTER replay test** (`tests/test_lobster_replay.cpp`) drives the market-data reconciliation logic with synthetic fixtures in LOBSTER's exact CSV format, since the real data isn't redistributed here. It checks that a correct stream reconciles cleanly, that the warm-start seeding correctly bootstraps pre-existing opening liquidity the message stream never explains, and — importantly — that a deliberately corrupted published book and a dropped message are **detected**. A reconciler that silently passed everything would otherwise be indistinguishable from one that works.
 - **Allocator lifetime test** (`tests/test_memorypool.cpp`) exercises `MemoryPool<T>` with a non-trivially-destructible `T`. The pool is backed by raw uninitialized storage and destroys each object exactly once (on `deallocate`), so its own teardown can't double-destroy a slot — a bug that stays invisible with a trivially-destructible type like `Order` and only surfaces under a type that owns a heap buffer. It also drives a deliberately tiny pool past capacity to cover the **overflow path**: `deallocate` skips its heap-pointer lookup entirely unless the pool has ever spilled (see [Key Optimizations](#key-optimizations)), and that shortcut is only safe if a heap pointer can never be mistaken for a pooled slot — which would placement-destroy it and file it onto the free list as pool storage. The test releases pooled and heap objects interleaved and asserts each went down the route it came from; disabling the fast-path guard turns it red immediately.
 
@@ -91,6 +97,34 @@ Monotonic, and for one reason: every one of those runs ends on the *same* phanto
 **The remaining known limit — the depth window.** LOBSTER emits messages only for events *"in the requested price range"* (its readme). Liquidity that drifts below level N as better prices arrive can then be cancelled or executed **entirely outside the window, generating no message at all**, while a deeper level silently promotes into view in the published book. Tracing rows 12→13 of the AAPL session shows exactly this: `5876500 x 1160` vanishes from the venue's book with no corresponding message, and `5879000 x 500` appears at level 10 from outside the window. No reconstruction can recover events it was never told about, so the **deepest levels are structurally unreliable** and divergence there is expected rather than a bug. Reconciling a shallower window than you ingest (e.g. `run_lobster ... 5` against level-10 data) keeps the comparison inside the region the message stream can actually explain. Note that seeding always uses the file's **full** published depth even when the comparison is narrowed — liquidity below the comparison window still promotes into view as the top is consumed, so discarding it just guarantees a later divergence.
 
 Separately, this reconciles the *visible* book only — hidden executions are excluded by design.
+
+## Research: Does Order Flow Predict Price?
+
+A verified book reconstruction is infrastructure. [`research/`](research/) uses it to ask a
+question: **does order flow imbalance predict where the mid price goes next, and is the answer
+worth trading?** `run_lobster --emit-features` turns the replayer into a feature generator —
+one row per message carrying the reconstructed book state and the OFI increment — and a tested
+analysis library does the statistics.
+
+The result, in three lines:
+
+- **The signal is real.** Out-of-sample R² of 0.090 on the next interval's move, against a
+  500-trial permutation null centred at −0.003 (p = 0.0000). It is a third the strength of the
+  *contemporaneous* relationship (0.251), which is price impact and not tradeable.
+- **It does not pay for the spread.** 68% hit rate, +0.73 ticks gross per trade against a 2.14
+  tick spread: **−1.40 ticks net**, at t = −7.55.
+- **Holding longer appears to fix it, and that is an artefact.** Net turns positive past ~10s,
+  but those trades overlap; thinned to independent trades only 18 remain at t ≈ 1.7. The losing
+  result is robust, the winning one is not.
+
+The data is **synthetic, with known ground truth** — deliberately, since a study that only ever
+sees real data cannot tell a working pipeline from a leaking one. A control dataset with no
+informed flow at all still yields R² = 0.068 (opposite sign), which is the point: a nonzero R²
+is not evidence of information. Running the same pipeline on real LOBSTER data is one command,
+documented in [`research/README.md`](research/README.md).
+
+The generator writes LOBSTER-format files from an order book written independently of the C++
+engine, so replaying them is also a differential test — 60,000 messages, zero divergences.
 
 ## Performance
 
@@ -249,7 +283,8 @@ Limit-Order-Book/
 │   ├── OrderBook.hpp             # Book, Order, PriceLevel, Trade, DepthLevel
 │   ├── MemoryPool.hpp            # Pooled allocator over raw storage
 │   ├── MarketDataFeed.hpp        # CSV tick parser / replayer
-│   └── LobsterReplay.hpp         # LOBSTER replay + book reconciliation
+│   ├── LobsterReplay.hpp         # LOBSTER replay + book reconciliation
+│   └── FeatureEmit.hpp           # Per-update feature/OFI emission for research/
 ├── src/
 │   ├── OrderBook.cpp             # Core matching engine
 │   ├── replay_main.cpp           # Market data replayer entry point
@@ -260,9 +295,15 @@ Limit-Order-Book/
 │   ├── test_matching.cpp         # Unit tests for matching logic
 │   ├── test_differential.cpp     # Randomized differential test vs. reference model
 │   ├── test_lobster_replay.cpp   # LOBSTER reconciliation (synthetic fixtures)
+│   ├── test_features.cpp         # OFI increments vs. hand-computed values
 │   └── test_memorypool.cpp       # Allocator lifetime + overflow-path test
 ├── benchmarks/
 │   └── benchmark_latency.cpp     # Depth sweep, cancels, allocator A/B, handler cost
+├── research/                    # Microstructure study — see research/README.md
+│   ├── ofi_study.ipynb           # The study, executed with outputs
+│   ├── ofi_lib.py                # Panel, forward returns, OOS fit, costs
+│   ├── test_ofi_lib.py           # Tests for the analysis code
+│   └── make_synthetic_lobster.py # LOBSTER-format generator, known ground truth
 ├── data/
 │   └── ticks.csv                 # Sample tick data for the replayer
 ├── .github/workflows/ci.yml      # Debug + Release + sanitizer CI
