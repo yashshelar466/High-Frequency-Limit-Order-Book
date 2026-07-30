@@ -259,6 +259,39 @@ void test_recover_mode_adopts_unannounced_level() {
     std::cout << "[PASS] LOBSTER Replay Recover Mode Adopts Unannounced Level Test" << std::endl;
 }
 
+void test_recover_mode_prunes_phantom_level() {
+    // Mirror image of the unannounced-level case, and the shape that ended the
+    // depth-10 run on AAPL 2012-06-21: a level we track that the venue does
+    // NOT have. Liquidity that drifts below the published window can be
+    // cancelled or executed there without generating any message, so our copy
+    // outlives the real order and resurfaces as a phantom.
+    std::vector<std::string> messages = {
+        "34200.0,1,500,10,5850000,1",    // msg 1: our own order, best bid
+        "34200.1,1,501,30,5852000,-1",   // msg 2: an ask; touches neither bid level
+    };
+    std::vector<std::string> rows = {
+        // Row 1: bid 5849000 x 200 is pre-existing liquidity, seeded by us.
+        book_row({{5851000, 100}}, {{5850000, 10}, {5849000, 200}}),
+        // Row 2: that bid level is simply GONE — no message ever removed it.
+        // The venue pads bid level 2, so it is reporting its complete book.
+        book_row({{5851000, 100}, {5852000, 30}}, {{5850000, 10}}),
+    };
+    write_file("lobster_prune_message.csv", messages);
+    write_file("lobster_prune_orderbook.csv", rows);
+
+    lobster::Stats st;
+    std::string err;
+    bool ok = lobster::replay_and_reconcile(
+        "lobster_prune_message.csv", "lobster_prune_orderbook.csv",
+        LEVELS, st, err, /*recover=*/true);
+
+    if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
+    CHECK(ok);
+    CHECK(st.pruned_levels == 1);   // the phantom was dropped, and counted
+
+    std::cout << "[PASS] LOBSTER Replay Recover Mode Prunes Phantom Level Test" << std::endl;
+}
+
 void test_recover_mode_still_detects_size_mismatch() {
     // Recover mode must only forgive levels that are *missing*. A level we do
     // track whose size disagrees with the venue is a genuine reconstruction
@@ -328,6 +361,7 @@ void cleanup() {
                           "lobster_depth_message.csv", "lobster_depth_orderbook.csv",
                           "lobster_unann_message.csv", "lobster_unann_orderbook.csv",
                           "lobster_rec_message.csv", "lobster_rec_orderbook.csv",
+                          "lobster_prune_message.csv", "lobster_prune_orderbook.csv",
                           "lobster_recbad_message.csv", "lobster_recbad_orderbook.csv",
                           "lobster_bad_message.csv", "lobster_bad_orderbook.csv",
                           "lobster_drop_message.csv", "lobster_drop_orderbook.csv"}) {
@@ -345,6 +379,7 @@ int main() {
     test_seeds_full_depth_when_comparing_shallower();
     test_strict_mode_stops_at_unannounced_level();
     test_recover_mode_adopts_unannounced_level();
+    test_recover_mode_prunes_phantom_level();
     test_recover_mode_still_detects_size_mismatch();
     test_detects_corrupted_book();
     test_detects_dropped_message();

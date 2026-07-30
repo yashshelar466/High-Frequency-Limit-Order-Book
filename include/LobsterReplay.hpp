@@ -69,6 +69,7 @@ struct Stats {
     uint64_t unknown_refs = 0;      // delete/execute naming an order we never saw
     uint64_t seed_attributed = 0;   // unknown id resolved against seeded liquidity
     uint64_t recovered_levels = 0;  // published levels adopted in recover mode
+    uint64_t pruned_levels = 0;     // phantom levels dropped in recover mode
     uint64_t unexpected_trades = 0; // engine matched — should never happen
 };
 
@@ -223,6 +224,76 @@ inline size_t recover_missing_levels(OrderBook& book,
         ++recovered;
     }
     return recovered;
+}
+
+// Drop levels we hold that the venue does not ("recover" mode, second half).
+//
+// The mirror image of recover_missing_levels: liquidity that drifts *below* the
+// published window can be cancelled or executed there, generating no message,
+// so a level we are tracking can die without us ever being told. It then
+// resurfaces as a phantom once the levels above it clear.
+//
+// A level is only judged when the published book is authoritative about its
+// price. For asks that means prices at or inside the deepest published ask;
+// beyond that the venue simply isn't reporting, and absence proves nothing. If
+// the venue padded the side (fewer live levels than requested) it has shown its
+// entire book, so every level we hold in the window is judgeable.
+inline size_t prune_phantom_levels(OrderBook& book,
+                                   const std::vector<PubLevel>& pub_asks,
+                                   const std::vector<PubLevel>& pub_bids,
+                                   SeedIndex& seeds, size_t levels) {
+    size_t pruned = 0;
+
+    auto drop_level = [&](uint32_t price, bool is_buy) {
+        const PriceLevel* lvl = is_buy ? book.get_bid_level(price)
+                                       : book.get_ask_level(price);
+        if (!lvl) return;
+        std::vector<uint64_t> ids;                 // collect first: cancelling relinks
+        for (const Order* o = lvl->head; o; o = o->next) ids.push_back(o->id);
+        for (uint64_t id : ids) book.cancel_order(id);
+        seeds.erase({is_buy, price});
+        ++pruned;
+    };
+
+    // --- asks ---------------------------------------------------------------
+    {
+        std::vector<uint32_t> published;
+        for (const auto& l : pub_asks)
+            if (l.present) published.push_back(static_cast<uint32_t>(l.price));
+        bool venue_complete = published.size() < levels;   // padding => full book shown
+        uint32_t deepest = published.empty() ? 0 : published.back();
+
+        std::vector<uint32_t> doomed;
+        for (const auto& mine : book.get_ask_depth(levels)) {
+            if (!venue_complete && published.empty()) break;
+            if (!venue_complete && mine.price > deepest) continue;   // outside window
+            bool listed = false;
+            for (uint32_t p : published) if (p == mine.price) { listed = true; break; }
+            if (!listed) doomed.push_back(mine.price);
+        }
+        for (uint32_t p : doomed) drop_level(p, /*is_buy=*/false);
+    }
+
+    // --- bids ---------------------------------------------------------------
+    {
+        std::vector<uint32_t> published;
+        for (const auto& l : pub_bids)
+            if (l.present) published.push_back(static_cast<uint32_t>(l.price));
+        bool venue_complete = published.size() < levels;
+        uint32_t deepest = published.empty() ? 0 : published.back();
+
+        std::vector<uint32_t> doomed;
+        for (const auto& mine : book.get_bid_depth(levels)) {
+            if (!venue_complete && published.empty()) break;
+            if (!venue_complete && mine.price < deepest) continue;   // outside window
+            bool listed = false;
+            for (uint32_t p : published) if (p == mine.price) { listed = true; break; }
+            if (!listed) doomed.push_back(mine.price);
+        }
+        for (uint32_t p : doomed) drop_level(p, /*is_buy=*/true);
+    }
+
+    return pruned;
 }
 
 inline void apply_message(OrderBook& book, const Message& m, Stats& st,
@@ -395,6 +466,8 @@ inline bool replay_and_reconcile(const std::string& msg_path,
         // In recover mode, adopt any published level we hold nothing at before
         // comparing — a windowed feed can surface liquidity it never announced.
         if (recover) {
+            st.pruned_levels +=
+                prune_phantom_levels(book, pub_asks, pub_bids, seeds, levels);
             st.recovered_levels +=
                 recover_missing_levels(book, pub_asks, pub_bids, seeds, synthetic_id);
         }

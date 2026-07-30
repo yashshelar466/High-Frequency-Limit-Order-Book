@@ -68,7 +68,9 @@ int main(int argc, char** argv) {
               << st.unknown_refs << "\n";
     if (recover) {
         std::cout << "  unexplained levels adopted from the published book: "
-                  << st.recovered_levels << "\n";
+                  << st.recovered_levels << "\n"
+                  << "  phantom levels pruned (died outside the window): "
+                  << st.pruned_levels << "\n";
     }
     return 0;
 }
