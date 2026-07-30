@@ -197,3 +197,29 @@ void OrderBook::amend_order(uint64_t id, uint32_t new_price, uint32_t new_qty) {
     cancel_order(id);
     insert_order(id, new_price, new_qty, is_buy);
 }
+
+void OrderBook::reduce_order(uint64_t id, uint32_t qty_delta) {
+    auto it = order_map.find(id);
+    if (it == order_map.end()) return;   // unknown or already gone
+    if (qty_delta == 0) return;
+
+    Order* order = it->second;
+
+    // A reduction that meets or exceeds the resting size removes the order.
+    if (qty_delta >= order->qty) {
+        cancel_order(id);
+        return;
+    }
+
+    // Partial reduction: shrink in place so the order keeps its queue position.
+    PriceLevel* level = nullptr;
+    if (order->is_buy) {
+        auto lit = bids.find(order->price);
+        if (lit != bids.end()) level = lit->second;
+    } else {
+        auto lit = asks.find(order->price);
+        if (lit != asks.end()) level = lit->second;
+    }
+    if (level) level->total_volume -= qty_delta;   // keep bookkeeping in sync
+    order->qty -= qty_delta;
+}

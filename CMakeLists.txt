@@ -39,6 +39,15 @@ target_link_libraries(run_diff PRIVATE orderbook)
 add_executable(run_pool tests/test_memorypool.cpp)
 target_link_libraries(run_pool PRIVATE orderbook)
 
+# LOBSTER market-data replay: reconciles the reconstructed book against a
+# venue-published book. The CLI takes real data files (not redistributed here);
+# the test drives the same logic with synthetic LOBSTER-format fixtures.
+add_executable(run_lobster src/lobster_replay.cpp)
+target_link_libraries(run_lobster PRIVATE orderbook)
+
+add_executable(run_lobster_test tests/test_lobster_replay.cpp)
+target_link_libraries(run_lobster_test PRIVATE orderbook)
+
 # The latency benchmark always wants aggressive optimization, independent of
 # the overall build type.
 add_executable(run_benchmark benchmarks/benchmark_latency.cpp)
@@ -52,3 +61,5 @@ add_test(NAME unit COMMAND run_tests)
 add_test(NAME differential COMMAND run_diff)
 
 add_test(NAME memory_pool COMMAND run_pool)
+
+add_test(NAME lobster_replay COMMAND run_lobster_test)

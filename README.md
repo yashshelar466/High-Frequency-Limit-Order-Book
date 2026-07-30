@@ -17,6 +17,7 @@ A single-threaded limit order book matching engine built in C++17, designed for 
 - [L2 Depth Snapshots](#l2-depth-snapshots)
 - [Trade & Execution Reporting](#trade--execution-reporting)
 - [Testing](#testing)
+- [Real Market-Data Reconciliation (LOBSTER)](#real-market-data-reconciliation-lobster)
 - [Market Data Feed & Replayer](#market-data-feed--replayer)
 - [Structure](#structure)
 - [Quick Start](#quick-start)
@@ -150,13 +151,41 @@ Trades execute at the resting maker's price (price-time priority), so a single c
 
 ## Testing
 
-Three suites guard the matching engine:
+Four suites guard the matching engine:
 
 - **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, top-of-book reset after a level is emptied, amend/cancel-replace priority semantics, IOC/FOK/MARKET handling, and L2 depth snapshots (including empty and one-sided books).
 - **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random operations — LIMIT / IOC / FOK / MARKET inserts, cancels, amends, duplicate-ID attempts, and crossings — at both the production engine and a deliberately simple `std::map`-based reference model, checking they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
+- **LOBSTER replay test** (`tests/test_lobster_replay.cpp`) drives the market-data reconciliation logic with synthetic fixtures in LOBSTER's exact CSV format, since the real data isn't redistributed here. It checks both that a correct stream reconciles cleanly *and* — importantly — that a deliberately corrupted published book and a dropped message are **detected**. A reconciler that silently passed everything would otherwise be indistinguishable from one that works.
 - **Allocator lifetime test** (`tests/test_memorypool.cpp`) exercises `MemoryPool<T>` with a non-trivially-destructible `T`. The pool is backed by raw uninitialized storage and destroys each object exactly once (on `deallocate`), so its own teardown can't double-destroy a slot — a bug that stays invisible with a trivially-destructible type like `Order` and only surfaces under a type that owns a heap buffer.
 
 **Checks are never compiled out.** All assertions go through a `CHECK` macro (`tests/check.hpp`) that prints the failed expression and exits non-zero, rather than `assert`, which expands to nothing whenever `NDEBUG` is defined — as it is in any optimized Release build. CI therefore runs the suites in **Debug and Release**, plus a third pass under **AddressSanitizer + UndefinedBehaviorSanitizer** (explicitly a Debug build, so the sanitizers aren't weakened by `-O3`/`NDEBUG`). A red CI job means a real failure; injecting a deliberate bug into the matching path turns the suites red in every configuration.
+
+## Real Market-Data Reconciliation (LOBSTER)
+
+The randomized differential test checks the engine against a reference model I wrote. The stronger test is checking it against **a real exchange's own book**.
+
+[LOBSTER](https://lobsterdata.com/info/DataSamples.php) publishes two aligned CSVs per ticker-day: a **message file** (every event — new limit orders, partial cancels, deletions, visible and hidden executions) and an **orderbook file** whose row *k* is the venue's published top-N book *after* message *k*. `run_lobster` replays the message stream through the engine and compares the reconstructed book against the published one after **every single message**, exiting non-zero on the first divergence.
+
+```bash
+# Download a free sample day from lobsterdata.com into data/ (not redistributed here)
+./build/run_lobster data/AAPL_2012-06-21_34200000_57600000_message_10.csv \
+                    data/AAPL_2012-06-21_34200000_57600000_orderbook_10.csv 10
+```
+
+How the events map onto the engine:
+
+| LOBSTER event | Applied as |
+| ------------- | ---------- |
+| 1 — new limit order | `insert_order` (the stream is already matched, so it rests) |
+| 2 — partial cancel | `reduce_order` (shrink in place, keeping queue priority) |
+| 3 — full delete | `cancel_order` |
+| 4 — visible execution | `reduce_order` — the venue already matched it |
+| 5 — hidden execution | skipped; hidden liquidity is not on the visible book |
+| 6/7 — cross, halt | skipped (counted and reported) |
+
+Two details worth calling out. First, executions are applied as **reductions rather than by letting the engine match** — LOBSTER's stream is post-match, so re-matching it would double-count. The replayer registers a trade handler that should therefore *never* fire; if it does, the book has drifted into a crossed state and the run fails loudly. Second, event type 2 and 4 both express a *delta* ("this order shrank by N"), which is why the engine has `reduce_order` alongside `amend_order`'s absolute-size semantics — real feeds publish deltas.
+
+**Caveats, stated plainly:** this reconciles the *visible* limit order book only. Hidden executions are excluded by design, and a delete or execution referencing an order that was resting before the file began cannot be applied (these are counted and reported rather than silently ignored).
 
 ## Market Data Feed & Replayer
 
@@ -171,15 +200,18 @@ Limit-Order-Book/
 ├── include/                     # Public headers
 │   ├── OrderBook.hpp             # Book, Order, PriceLevel, Trade, DepthLevel
 │   ├── MemoryPool.hpp            # Pooled allocator over raw storage
-│   └── MarketDataFeed.hpp        # CSV tick parser / replayer
+│   ├── MarketDataFeed.hpp        # CSV tick parser / replayer
+│   └── LobsterReplay.hpp         # LOBSTER replay + book reconciliation
 ├── src/
 │   ├── OrderBook.cpp             # Core matching engine
 │   ├── replay_main.cpp           # Market data replayer entry point
+│   ├── lobster_replay.cpp        # LOBSTER reconciliation CLI
 │   └── main.cpp                  # Minimal usage example
 ├── tests/
 │   ├── check.hpp                 # CHECK macro (survives NDEBUG — see Testing)
 │   ├── test_matching.cpp         # Unit tests for matching logic
 │   ├── test_differential.cpp     # Randomized differential test vs. reference model
+│   ├── test_lobster_replay.cpp   # LOBSTER reconciliation (synthetic fixtures)
 │   └── test_memorypool.cpp       # Allocator lifetime test (non-trivial types)
 ├── benchmarks/
 │   └── benchmark_latency.cpp
@@ -208,7 +240,7 @@ cd High-Frequency-Limit-Order-Book
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-# Run the test suites (unit + differential + allocator) via CTest
+# Run the test suites (unit + differential + allocator + LOBSTER) via CTest
 ctest --test-dir build --output-on-failure
 
 # Run the individual binaries
@@ -234,6 +266,7 @@ No CMake? Each target is a single translation unit plus `src/OrderBook.cpp`:
 g++ -std=c++17 -Iinclude src/OrderBook.cpp tests/test_matching.cpp -o run_tests && ./run_tests
 g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_differential.cpp -o run_diff && ./run_diff
 g++ -std=c++17 tests/test_memorypool.cpp -o run_pool && ./run_pool
+g++ -O2 -std=c++17 -Iinclude src/OrderBook.cpp tests/test_lobster_replay.cpp -o run_lobster_test && ./run_lobster_test
 g++ -O3 -std=c++17 -Iinclude src/OrderBook.cpp benchmarks/benchmark_latency.cpp -o run_benchmark && ./run_benchmark
 g++ -std=c++17 -Iinclude src/OrderBook.cpp src/replay_main.cpp -o run_feed && ./run_feed
 ```

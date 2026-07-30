@@ -136,6 +136,13 @@ public:
     // unchanged. The order keeps its original side.
     void amend_order(uint64_t id, uint32_t new_price, uint32_t new_qty);
 
+    // Reduce a resting order's size by `qty_delta`, keeping its FIFO position.
+    // If `qty_delta` meets or exceeds the order's current size, the order is
+    // removed entirely. Unlike amend_order (which takes an absolute new size),
+    // this takes a delta — the form real market-data feeds publish for partial
+    // cancels and for executions against a resting order.
+    void reduce_order(uint64_t id, uint32_t qty_delta);
+
     // Trade/execution reporting. Register a handler to observe every fill the
     // matching engine produces — the foundation for backtesting (trade blotter,
     // PnL, VWAP) and for reconciling against an exchange's own execution feed.
@@ -161,6 +168,14 @@ public:
     const PriceLevel* get_ask_level(uint32_t price) const {
         auto it = asks.find(price);
         return it == asks.end() ? nullptr : it->second;
+    }
+
+    // Remaining size of a live order, or 0 if no such order is resting.
+    // Lets a caller distinguish "this id is on the book" from "this id is
+    // unknown" without exposing the internal Order.
+    uint32_t get_order_qty(uint64_t id) const {
+        auto it = order_map.find(id);
+        return it == order_map.end() ? 0u : it->second->qty;
     }
 
     // L2 (market-by-price) depth snapshots: up to `levels` price levels from the

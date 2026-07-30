@@ -496,6 +496,43 @@ void test_market_order_empty_book_noop() {
     std::cout << "[PASS] Market Order Empty Book No-op Test" << std::endl;
 }
 
+void test_reduce_order_keeps_priority_then_removes() {
+    OrderBook book;
+
+    // Three resting asks at one level, in FIFO order.
+    book.insert_order(1, 105, 50, false);
+    book.insert_order(2, 105, 30, false);
+    book.insert_order(3, 105, 20, false);
+
+    // Partial reduction: order 1 shrinks but keeps its place at the head. This
+    // is the property a market-data replay depends on — a partial cancel or an
+    // execution against a resting order must not cost it queue priority.
+    book.reduce_order(1, 20);
+    const PriceLevel* lvl = book.get_ask_level(105);
+    CHECK(lvl != nullptr);
+    CHECK(lvl->order_count == 3);          // still three orders resting
+    CHECK(lvl->total_volume == 80);        // 30 + 30 + 20
+    CHECK(lvl->head->id == 1 && lvl->head->qty == 30);
+    CHECK(lvl->head->next->id == 2);
+
+    // A reduction >= the remaining size removes the order entirely.
+    book.reduce_order(1, 30);
+    lvl = book.get_ask_level(105);
+    CHECK(lvl != nullptr);
+    CHECK(lvl->order_count == 2);
+    CHECK(lvl->total_volume == 50);        // 30 + 20
+    CHECK(lvl->head->id == 2);             // order 2 now has priority
+    CHECK(lvl->head->next->id == 3);
+
+    // Reducing an already-removed or unknown id is a safe no-op.
+    book.reduce_order(1, 10);
+    book.reduce_order(999, 10);
+    lvl = book.get_ask_level(105);
+    CHECK(lvl != nullptr && lvl->order_count == 2 && lvl->total_volume == 50);
+
+    std::cout << "[PASS] Reduce Order Keeps Priority Then Removes Test" << std::endl;
+}
+
 int main() {
     std::cout << "--- Running Expanded Unit Tests ---" << std::endl;
     test_partial_fill();
@@ -524,6 +561,7 @@ int main() {
     test_fok_fills_when_sufficient();
     test_market_order_sweeps_ignoring_price();
     test_market_order_empty_book_noop();
+    test_reduce_order_keeps_priority_then_removes();
     std::cout << "--- All Tests Passed Successfully! ---" << std::endl;
     return 0;
 }

@@ -61,6 +61,10 @@ compile_commands.json
 # Claude Code local settings (personal, not for the repo)
 .claude/settings.local.json
 
+# LOBSTER sample data — download separately (see README); not redistributed here
+data/*_message_*.csv
+data/*_orderbook_*.csv
+
 # vcpkg
 vcpkg_installed/
 
