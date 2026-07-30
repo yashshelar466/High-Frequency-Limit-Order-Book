@@ -149,6 +149,14 @@ public:
     // The handler is invoked synchronously from within insert_order, once per
     // fill, in execution order. Leaving it unset keeps the hot path free of any
     // reporting overhead (a single null check per fill).
+    //
+    // Dispatch cost, since this is a latency-sensitive path: std::function is
+    // type-erased, so a set handler costs an indirect call per fill that the
+    // compiler cannot inline — measured at ~2 ns/fill by run_benchmark
+    // (p50 87 -> 89 ns on a single-fill crossing insert). Templating OrderBook
+    // on the handler type would inline it away, at the cost of making the
+    // engine header-only and making its type depend on its observer. That
+    // tradeoff is deliberately not taken here; see README.
     using TradeHandler = std::function<void(const Trade&)>;
     void set_trade_handler(TradeHandler handler) { trade_handler = std::move(handler); }
 

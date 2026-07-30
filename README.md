@@ -1,23 +1,23 @@
-[![CI](https://github.com/yashshelar466/High-Frequency-Limit-Order-Book/actions/workflows/ci.yml/badge.svg)](https://github.com/yashshelar466/High-Frequency-Limit-Order-Book/actions/workflows/ci.yml)
-
 # High-Frequency Limit Order Book
 
+[![CI](https://github.com/yashshelar466/High-Frequency-Limit-Order-Book/actions/workflows/ci.yml/badge.svg)](https://github.com/yashshelar466/High-Frequency-Limit-Order-Book/actions/workflows/ci.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
-[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A single-threaded limit order book matching engine built in C++17, designed for low-latency execution and deterministic backtesting. Implements price-time priority matching over ordered price maps, a custom memory pool allocator, LIMIT/IOC/FOK/MARKET order types, L2 depth snapshots, and a CSV-driven market data replayer for simulating tick-level trading strategies.
+A single-threaded limit order book matching engine in C++17, built to be **correct first and measured honestly second**. Price-time priority matching over ordered price maps, a pooled order allocator, LIMIT/IOC/FOK/MARKET order types, L2 depth snapshots, and a market-data replayer that reconciles the reconstructed book against a real exchange's own published book, message by message.
+
+The claim this project makes is not "fastest." It is: *the matching logic is verified against a reference model and against real NASDAQ data, and every latency number here comes with the machine it was measured on and the benchmark that produced it.*
 
 ## Table of Contents
 - [Overview](#overview)
+- [Correctness](#correctness)
+- [Real Market-Data Reconciliation (LOBSTER)](#real-market-data-reconciliation-lobster)
 - [Performance](#performance)
 - [Design & Architecture](#design--architecture)
 - [Key Optimizations](#key-optimizations)
 - [Order Types](#order-types)
 - [L2 Depth Snapshots](#l2-depth-snapshots)
 - [Trade & Execution Reporting](#trade--execution-reporting)
-- [Testing](#testing)
-- [Real Market-Data Reconciliation (LOBSTER)](#real-market-data-reconciliation-lobster)
 - [Market Data Feed & Replayer](#market-data-feed--replayer)
 - [Structure](#structure)
 - [Quick Start](#quick-start)
@@ -26,137 +26,14 @@ A single-threaded limit order book matching engine built in C++17, designed for 
 
 This matching engine implements the core matching logic used in real exchange systems: orders are matched by **price priority**, then **time priority** (FIFO within a price level). It supports the standard order operations — **insert**, **cancel**, and **amend/cancel-replace** (an in-place quantity reduction keeps queue priority; a price change or size increase re-enters the order as a fresh aggressor). The engine is single-threaded by design — this removes lock contention and makes execution fully deterministic, which matters for reproducible backtesting and for reasoning precisely about worst-case latency.
 
-## Performance
+## Correctness
 
-Latency is measured with `-O3` and reported **across book depths**, since level lookup is `O(log L)` in the number of live price levels `L` — a single narrow band would flatter the numbers. Resting inserts and cancels are reported separately because they exercise different code paths.
-
-> **Timer-resolution caveat.** On this Windows machine `QueryPerformanceCounter` ticks at ~100 ns, so every figure below is quantized to 100 ns, and the empty-bracket timer overhead (p50) measures as 0 ns — i.e. below a single clock tick. Treat these as ~100 ns-resolution measurements: the **trend across depth** is the meaningful signal, not the absolute value of any one bucket. On Linux the benchmark falls back to `std::chrono::steady_clock` (true nanosecond resolution).
-
-**Resting-insert latency vs. book depth** (one-sided book, no crossing; n = 50,000 per row)
-
-| Live price levels (L) | p50    | p99      |
-| --------------------- | ------ | -------- |
-| 21                    | 200 ns | 2,100 ns |
-| 1,000                 | 300 ns | 2,400 ns |
-| 20,000                | 600 ns | 3,200 ns |
-
-p50 climbing from 200 ns at 21 levels to 300 ns at 1,000 to 600 ns at 20,000 is the `O(log L)` cost of the ordered-map lookup made directly visible; p99 shows the same trend (2,100 → 2,400 → 3,200 ns), the same design cost surfacing further out in the tail. The earlier fixed-array design was `O(1)` here — a deliberate trade for an uncapped price range and cheap L2 depth (see [Design & Architecture](#design--architecture)).
-
-**Cancels** (intrusive-list unlink at a random queue position; n = 80,000)
-
-| Percentile | Latency      |
-| ---------- | ------------ |
-| avg        | 619.046 ns   |
-| p50        | 600 ns       |
-| p90        | 700 ns       |
-| p99        | 1000 ns      |
-| p99.9      | 18,900 ns    |
-| max        | 126,400 ns   |
-
-> The `max` is ~7× the p99.9 — OS scheduler jitter (context switches, page faults), not the engine. The p99.9 column is the more representative worst case for the algorithm itself.
-
-**Test Environment:** Windows 11, Intel Core i5-8365U @ 1.60GHz, GCC 16.1.0 (MinGW-w64), `-O3`, `QueryPerformanceCounter` (~100 ns resolution).
-> Latency numbers are meaningless without hardware context — always report the machine a benchmark ran on.
-
-## Design & Architecture
-
-```
-                    ┌─────────────────────┐
-                    │     MarketDataFeed    │
-                    │   (CSV tick replay)   │
-                    └──────────┬───────────┘
-                               │ ADD / CANCEL / EXECUTE
-                               ▼
-                    ┌─────────────────────┐
-                    │      OrderBook        │
-                    │  price-time priority  │
-                    └──────────┬───────────┘
-                               │
-                 ┌─────────────┴─────────────┐
-                 ▼                           ▼
-        ┌────────────────┐         ┌────────────────┐
-        │   Bid Levels     │         │   Ask Levels     │
-        │  std::map desc   │         │  std::map asc    │
-        │  price → FIFO    │         │  price → FIFO    │
-        │  linked list     │         │  linked list     │
-        └────────────────┘         └────────────────┘
-                 │                           │
-                 └─────────────┬─────────────┘
-                               ▼
-                    ┌─────────────────────┐
-                    │   MemoryPool<Order>   │
-                    │  placement-new alloc  │
-                    └─────────────────────┘
-```
-
-Each side of the book is an ordered `std::map` from price to price level — bids descending, asks ascending — so the best bid/ask is always the first key (`begin()`), and depth walks in price order for free. Each price level is an intrusive doubly-linked list, so cancellation is O(1) (unlink in place, no shifting) and appending a new order at an existing level is O(1); locating or creating the level is `O(log L)` in the number of distinct live price levels `L`. The full `uint32` price range is supported (only `0` and `0xFFFFFFFF` are reserved as empty-side sentinels).
-
-## Key Optimizations
-
-**Pooled order allocation.** A custom `MemoryPool<Order>` serves `Order` objects from a pre-allocated block via placement `new`, keeping order construction off the general heap. This pools *orders only* — each resting order still allocates an `unordered_map` node (the ID index), and each new price level allocates a `PriceLevel` plus a `std::map` node. Measured on the benchmark workload that's roughly **1.1 `new` calls per order**: the pool removes the per-order `Order` allocation and its jitter, not all allocation.
-
-**Ordered price maps.** Bids and asks are ordered maps, so top-of-book is `begin()` (no scanning), depleted levels drop out cleanly, and L2 depth snapshots are a direct ordered walk. Level lookup is `O(log L)` in the number of live price levels — a deliberate trade against the previous fixed-array `O(1)` in exchange for an uncapped price range and correct, cheap depth queries.
-
-## Order Types
-
-The engine supports the standard time-in-force / order types via an `OrderType` argument to `insert_order` (the 4-argument form defaults to `LIMIT`):
-
-| Type     | Behavior |
-| -------- | -------- |
-| `LIMIT`  | Match whatever crosses the limit price, then rest any remainder on the book. |
-| `IOC`    | Immediate-Or-Cancel: match what crosses now, discard the remainder (never rests). |
-| `FOK`    | Fill-Or-Kill: fill the entire quantity immediately, or do nothing at all. |
-| `MARKET` | Ignore the price limit and take liquidity until filled or the opposite side is exhausted; never rests. |
-
-```cpp
-book.insert_order(1, 105, 30, false);                    // resting LIMIT ask
-book.insert_order(2, 105, 50, true, OrderType::IOC);     // fills 30, drops the rest
-book.insert_order(3, 0,  40, true, OrderType::MARKET);   // price ignored; sweeps the book
-```
-
-`FOK` first checks resting liquidity (an ordered walk of the opposite side) and only proceeds if the full size can be filled, so it never leaves a partial fill behind.
-
-## L2 Depth Snapshots
-
-Because each side of the book is an ordered map, market-by-price depth is a direct top-of-book walk:
-
-```cpp
-for (const DepthLevel& lvl : book.get_ask_depth(5))   // best 5 ask levels, low -> high
-    std::cout << lvl.price << " x " << lvl.volume << " (" << lvl.order_count << ")\n";
-
-book.get_bid_depth(5);   // best 5 bid levels, high -> low
-book.spread();           // best_ask - best_bid (0 if one-sided)
-book.mid_price();        // (best_bid + best_ask) / 2 (0 if one-sided)
-```
-
-Each `DepthLevel` carries `{ price, volume, order_count }`. The replayer prints a top-5 snapshot plus spread/mid after a run.
-
-## Trade & Execution Reporting
-
-Matching is only half the story — a backtester needs to *observe* the fills the engine produces. Register a trade handler and the engine invokes it synchronously for every fill, in execution order:
-
-```cpp
-OrderBook book;
-book.set_trade_handler([](const Trade& t) {
-    // taker_id  – aggressing (incoming) order
-    // maker_id  – resting order that was hit
-    // price     – execution price (the resting maker's price)
-    // qty       – quantity filled
-    // taker_is_buy – side of the aggressor
-    std::cout << t.qty << " @ " << t.price << '\n';
-});
-```
-
-Trades execute at the resting maker's price (price-time priority), so a single crossing insert can emit several `Trade`s — one per resting order it consumes. This is the hook for a trade blotter, PnL/VWAP, or reconciling against an exchange's own execution feed. When no handler is set, the hot path pays only a single null check per fill. The replayer (`src/replay_main.cpp`) uses it to print a blotter and compute VWAP over a tick file.
-
-## Testing
-
-Four suites guard the matching engine:
+A matching engine that is fast and wrong is worthless, so this is the part of the project I'd defend first. Four suites guard the engine, and two of them check it against something other than my own expectations — a reference implementation, and a real venue's published book.
 
 - **Unit tests** (`tests/test_matching.cpp`) cover specific behaviors: partial fills, full level sweeps, FIFO preservation after a partial fill, cancellation, invalid inputs, duplicate-order-ID rejection, top-of-book reset after a level is emptied, amend/cancel-replace priority semantics, IOC/FOK/MARKET handling, and L2 depth snapshots (including empty and one-sided books).
 - **Randomized differential test** (`tests/test_differential.cpp`) fires 300k random operations — LIMIT / IOC / FOK / MARKET inserts, cancels, amends, duplicate-ID attempts, and crossings — at both the production engine and a deliberately simple `std::map`-based reference model, checking they agree on top-of-book and the exact trade stream on every operation, and on full per-level FIFO/volume state periodically. Any divergence points straight at a bug in the fast path — this is what catches whole classes of matching-engine bugs (stale best-price tracking, duplicate-ID handling, misattributed fills) that example-based tests tend to miss.
 - **LOBSTER replay test** (`tests/test_lobster_replay.cpp`) drives the market-data reconciliation logic with synthetic fixtures in LOBSTER's exact CSV format, since the real data isn't redistributed here. It checks that a correct stream reconciles cleanly, that the warm-start seeding correctly bootstraps pre-existing opening liquidity the message stream never explains, and — importantly — that a deliberately corrupted published book and a dropped message are **detected**. A reconciler that silently passed everything would otherwise be indistinguishable from one that works.
-- **Allocator lifetime test** (`tests/test_memorypool.cpp`) exercises `MemoryPool<T>` with a non-trivially-destructible `T`. The pool is backed by raw uninitialized storage and destroys each object exactly once (on `deallocate`), so its own teardown can't double-destroy a slot — a bug that stays invisible with a trivially-destructible type like `Order` and only surfaces under a type that owns a heap buffer.
+- **Allocator lifetime test** (`tests/test_memorypool.cpp`) exercises `MemoryPool<T>` with a non-trivially-destructible `T`. The pool is backed by raw uninitialized storage and destroys each object exactly once (on `deallocate`), so its own teardown can't double-destroy a slot — a bug that stays invisible with a trivially-destructible type like `Order` and only surfaces under a type that owns a heap buffer. It also drives a deliberately tiny pool past capacity to cover the **overflow path**: `deallocate` skips its heap-pointer lookup entirely unless the pool has ever spilled (see [Key Optimizations](#key-optimizations)), and that shortcut is only safe if a heap pointer can never be mistaken for a pooled slot — which would placement-destroy it and file it onto the free list as pool storage. The test releases pooled and heap objects interleaved and asserts each went down the route it came from; disabling the fast-path guard turns it red immediately.
 
 **Checks are never compiled out.** All assertions go through a `CHECK` macro (`tests/check.hpp`) that prints the failed expression and exits non-zero, rather than `assert`, which expands to nothing whenever `NDEBUG` is defined — as it is in any optimized Release build. CI therefore runs the suites in **Debug and Release**, plus a third pass under **AddressSanitizer + UndefinedBehaviorSanitizer** (explicitly a Debug build, so the sanitizers aren't weakened by `-O3`/`NDEBUG`). A red CI job means a real failure; injecting a deliberate bug into the matching path turns the suites red in every configuration.
 
@@ -215,6 +92,149 @@ Monotonic, and for one reason: every one of those runs ends on the *same* phanto
 
 Separately, this reconciles the *visible* book only — hidden executions are excluded by design.
 
+## Performance
+
+Everything below is produced by `benchmarks/benchmark_latency.cpp` (`./build/run_benchmark`) — no figure in this README comes from anywhere else. Latency is measured with `-O3` and reported **across book depths**, since level lookup is `O(log L)` in the number of live price levels `L` and a single narrow band would flatter the numbers. Percentiles are reported rather than averages, because an average hides exactly the tail an exchange cares about.
+
+**Test environment:** Ubuntu 24.04, Intel Xeon @ 2.80 GHz (4 vCPU, shared cloud instance), GCC 13.3.0, `-O3`, `std::chrono::steady_clock`.
+
+> **Read the tails with suspicion.** This is a shared virtual machine, not tuned bare metal — no core pinning, no isolated CPUs, frequency scaling and neighbours both in play. p50 is stable to ±2 ns across runs and is the number to trust; p99.9 and `max` swing by an order of magnitude run to run and are dominated by scheduler preemption rather than by the engine. Where a comparison matters below, I quote the **difference between two arms measured in the same run**, which cancels both the timer overhead and most of the machine noise.
+
+> **Timer overhead:** the empty-bracket `now_ns()` pair costs **22 ns** at p50 on this machine, and the benchmark prints it first. That 22 ns is included in every absolute figure below — so a reported 107 ns insert is ~85 ns of engine work. It is *not* included in any A/B difference, since both arms pay it.
+
+**Resting-insert latency vs. book depth** (one-sided book, no crossing; n = 50,000 per row)
+
+| Live price levels (L) | p50    | p99      |
+| --------------------- | ------ | -------- |
+| 21                    | 107 ns | 2,672 ns |
+| 1,000                 | 152 ns | 2,493 ns |
+| 20,000                | 328 ns | 2,964 ns |
+
+p50 climbing 107 → 152 → 328 ns as the book grows from 21 to 20,000 live levels is the `O(log L)` ordered-map lookup made directly visible — a tripling of median latency across three orders of magnitude of depth, which is what `log L` should look like. This is a real cost of the design, not a rounding error, and it is the honest counterweight to the `std::map` choice: an array-indexed book over a bounded price range would be `O(1)` here (see [Design & Architecture](#design--architecture)). The p99 column shows no clean trend, for the reason in the caveat above — at that percentile this machine's noise floor is larger than the effect being measured.
+
+**Cancels** (intrusive-list unlink at a random queue position; n = 80,000)
+
+| Percentile | Latency    |
+| ---------- | ---------- |
+| avg        | 268.989 ns |
+| p50        | 226 ns     |
+| p90        | 371 ns     |
+| p99        | 614 ns     |
+| p99.9      | 3,269 ns   |
+| max        | 57,663 ns  |
+
+Cancel is an `O(1)` unlink, so the work here is the `unordered_map` id lookup plus pointer surgery; the `max` at ~18× the p99.9 is the VM, not the algorithm.
+
+**Allocator A/B — does the memory pool actually pay for itself?** Both arms run the identical churn pattern (hold 20,000 live `Order`s, then repeatedly release one at a random slot and allocate a replacement, timing the pair), one served by `MemoryPool<Order>` and one by global `new`/`delete`; n = 100,000 each.
+
+| Percentile | `MemoryPool` | `new`/`delete` | Difference |
+| ---------- | ------------ | -------------- | ---------- |
+| p50        | 31 ns        | 57 ns          | **−26 ns** |
+| p90        | 46 ns        | 96 ns          | −50 ns     |
+| p99        | 72 ns        | 184 ns         | −112 ns    |
+| p99.9      | 188 ns       | 444 ns         | −256 ns    |
+
+The pool saves ~26 ns per allocate/free pair at the median, and the gap widens sharply into the tail (−112 ns at p99, −256 ns at p99.9) — which is the more interesting result: a free-list pop has essentially fixed cost, while a general-purpose allocator's worst case includes size-class bookkeeping and occasional trips to the OS. Both arms pay the same 22 ns of timer overhead, so the *differences* in that last column are overhead-free. Net of it, the pool is roughly 9 ns vs. 35 ns of real work at p50. Note the scope of the claim: this measures the `Order` allocation only, and the engine performs ~1.1 `new` calls per order overall (see [Key Optimizations](#key-optimizations)), so this is not a whole-engine speedup.
+
+**Trade-handler dispatch cost.** The reporting hook is a `std::function`, so each fill pays an indirect call the compiler cannot inline. Identical single-fill crossing inserts, handler unset vs. set (n = 50,000 each): p50 **87 ns → 89 ns**, i.e. about **2 ns per fill**, reproducible to ±1 ns across runs. That is the real price of the type-erased handler — small, but it is a cost, and the alternative is discussed in [Trade & Execution Reporting](#trade--execution-reporting).
+
+Reproduce all of the above with `cmake --build build --target run_benchmark && ./build/run_benchmark`. If you run it on your own machine the absolute numbers will differ; the depth trend and the A/B gaps should not.
+
+## Design & Architecture
+
+```
+                    ┌─────────────────────┐
+                    │     MarketDataFeed    │
+                    │   (CSV tick replay)   │
+                    └──────────┬───────────┘
+                               │ ADD / CANCEL / EXECUTE
+                               ▼
+                    ┌─────────────────────┐
+                    │      OrderBook        │
+                    │  price-time priority  │
+                    └──────────┬───────────┘
+                               │
+                 ┌─────────────┴─────────────┐
+                 ▼                           ▼
+        ┌────────────────┐         ┌────────────────┐
+        │   Bid Levels     │         │   Ask Levels     │
+        │  std::map desc   │         │  std::map asc    │
+        │  price → FIFO    │         │  price → FIFO    │
+        │  linked list     │         │  linked list     │
+        └────────────────┘         └────────────────┘
+                 │                           │
+                 └─────────────┬─────────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │   MemoryPool<Order>   │
+                    │  placement-new alloc  │
+                    └─────────────────────┘
+```
+
+Each side of the book is an ordered `std::map` from price to price level — bids descending, asks ascending — so the best bid/ask is always the first key (`begin()`), and depth walks in price order for free. Each price level is an intrusive doubly-linked list, so cancellation is O(1) (unlink in place, no shifting) and appending a new order at an existing level is O(1); locating or creating the level is `O(log L)` in the number of distinct live price levels `L`. The full `uint32` price range is supported (only `0` and `0xFFFFFFFF` are reserved as empty-side sentinels).
+
+## Key Optimizations
+
+**Pooled order allocation.** A custom `MemoryPool<Order>` serves `Order` objects from a pre-allocated block via placement `new`, keeping order construction off the general heap. Measured against `new`/`delete` on the same churn pattern, this is worth **~26 ns per allocate/free pair at p50 and ~256 ns at p99.9** — the [A/B benchmark](#performance) is in the repo, and the tail is where the win actually lives.
+
+Two limits on that claim, both worth stating plainly. It pools *orders only*: each resting order still allocates an `unordered_map` node (the ID index), and each new price level allocates a `PriceLevel` plus a `std::map` node — roughly **1.1 `new` calls per order** on the benchmark workload. And it is a *fixed-capacity* pool, so it needs an answer for exhaustion: allocation past capacity falls back to the general heap, and `deallocate` has to know which of the two a pointer came from. The obvious implementation of that — look the pointer up in a set of heap allocations on every release — puts a hash and a probe on the cancel and fill paths of every run, including the overwhelming majority that never overflow at all. Instead a sticky `has_overflowed_` flag guards the lookup, so a pool that stays within capacity never consults the set. The overflow itself is recorded and read back through `overflow_total()` rather than logged: the first version wrote to `stderr` from inside `allocate()`, which is a locked, flushing, syscall-backed write per allocation, triggering precisely when the system is already in the trouble that exhausted the pool. Diagnostics belong out of the hot path.
+
+**Ordered price maps.** Bids and asks are ordered maps, so top-of-book is `begin()` (no scanning), depleted levels drop out cleanly, and L2 depth snapshots are a direct ordered walk. Level lookup is `O(log L)` in the number of live price levels — a deliberate trade against the previous fixed-array `O(1)` in exchange for an uncapped price range and correct, cheap depth queries. The [depth-swept benchmark](#performance) prices that trade at 107 → 328 ns p50 across 21 → 20,000 levels; a flat array indexed by price over a bounded tick range is the standard HFT answer and the most obvious next optimization here, at the cost of a hard price ceiling and memory proportional to the range rather than to live levels.
+
+## Order Types
+
+The engine supports the standard time-in-force / order types via an `OrderType` argument to `insert_order` (the 4-argument form defaults to `LIMIT`):
+
+| Type     | Behavior |
+| -------- | -------- |
+| `LIMIT`  | Match whatever crosses the limit price, then rest any remainder on the book. |
+| `IOC`    | Immediate-Or-Cancel: match what crosses now, discard the remainder (never rests). |
+| `FOK`    | Fill-Or-Kill: fill the entire quantity immediately, or do nothing at all. |
+| `MARKET` | Ignore the price limit and take liquidity until filled or the opposite side is exhausted; never rests. |
+
+```cpp
+book.insert_order(1, 105, 30, false);                    // resting LIMIT ask
+book.insert_order(2, 105, 50, true, OrderType::IOC);     // fills 30, drops the rest
+book.insert_order(3, 0,  40, true, OrderType::MARKET);   // price ignored; sweeps the book
+```
+
+`FOK` first checks resting liquidity (an ordered walk of the opposite side) and only proceeds if the full size can be filled, so it never leaves a partial fill behind.
+
+## L2 Depth Snapshots
+
+Because each side of the book is an ordered map, market-by-price depth is a direct top-of-book walk:
+
+```cpp
+for (const DepthLevel& lvl : book.get_ask_depth(5))   // best 5 ask levels, low -> high
+    std::cout << lvl.price << " x " << lvl.volume << " (" << lvl.order_count << ")\n";
+
+book.get_bid_depth(5);   // best 5 bid levels, high -> low
+book.spread();           // best_ask - best_bid (0 if one-sided)
+book.mid_price();        // (best_bid + best_ask) / 2 (0 if one-sided)
+```
+
+Each `DepthLevel` carries `{ price, volume, order_count }`. The replayer prints a top-5 snapshot plus spread/mid after a run.
+
+## Trade & Execution Reporting
+
+Matching is only half the story — a backtester needs to *observe* the fills the engine produces. Register a trade handler and the engine invokes it synchronously for every fill, in execution order:
+
+```cpp
+OrderBook book;
+book.set_trade_handler([](const Trade& t) {
+    // taker_id  – aggressing (incoming) order
+    // maker_id  – resting order that was hit
+    // price     – execution price (the resting maker's price)
+    // qty       – quantity filled
+    // taker_is_buy – side of the aggressor
+    std::cout << t.qty << " @ " << t.price << '\n';
+});
+```
+
+Trades execute at the resting maker's price (price-time priority), so a single crossing insert can emit several `Trade`s — one per resting order it consumes. This is the hook for a trade blotter, PnL/VWAP, or reconciling against an exchange's own execution feed. The replayer (`src/replay_main.cpp`) uses it to print a blotter and compute VWAP over a tick file.
+
+**The dispatch tradeoff, stated honestly.** `TradeHandler` is a `std::function`, which means every fill pays an indirect call through a type-erased target that cannot be inlined. [Measured](#performance): **~2 ns per fill** (p50 87 → 89 ns on a single-fill crossing insert), and nothing at all when no handler is set — that path is one null check. The alternative is to template `OrderBook` on the handler type, which would let the compiler inline the callback and fold away the branch entirely. I've deliberately not done that: it would make the engine header-only, force every translation unit to recompile the matching logic, and mean the engine's type changes with its observer — a steep price for 2 ns on a book whose median insert is ~85 ns and whose depth-scaling costs 200 ns on its own. If this engine were ever colocated and the 2 ns mattered, templating the handler is the fix, and the benchmark to justify it already exists.
+
 ## Market Data Feed & Replayer
 
 An event-driven `MarketDataFeed` parser streams tick data into the engine:
@@ -236,13 +256,13 @@ Limit-Order-Book/
 │   ├── lobster_replay.cpp        # LOBSTER reconciliation CLI
 │   └── main.cpp                  # Minimal usage example
 ├── tests/
-│   ├── check.hpp                 # CHECK macro (survives NDEBUG — see Testing)
+│   ├── check.hpp                 # CHECK macro (survives NDEBUG — see Correctness)
 │   ├── test_matching.cpp         # Unit tests for matching logic
 │   ├── test_differential.cpp     # Randomized differential test vs. reference model
 │   ├── test_lobster_replay.cpp   # LOBSTER reconciliation (synthetic fixtures)
-│   └── test_memorypool.cpp       # Allocator lifetime test (non-trivial types)
+│   └── test_memorypool.cpp       # Allocator lifetime + overflow-path test
 ├── benchmarks/
-│   └── benchmark_latency.cpp
+│   └── benchmark_latency.cpp     # Depth sweep, cancels, allocator A/B, handler cost
 ├── data/
 │   └── ticks.csv                 # Sample tick data for the replayer
 ├── .github/workflows/ci.yml      # Debug + Release + sanitizer CI
@@ -272,9 +292,10 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 
 # Run the individual binaries
-./build/run_benchmark    # latency & throughput benchmark
+./build/run_benchmark    # latency benchmark: depth sweep, cancels, allocator A/B, handler cost
 ./build/run_feed         # market data feed replayer (reads data/ticks.csv)
 ./build/demo             # minimal usage example
+./build/run_lobster      # LOBSTER reconciliation CLI (needs real data — see above)
 ```
 
 To build and test with sanitizers (as CI does):
