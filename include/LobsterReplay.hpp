@@ -202,6 +202,7 @@ inline bool replay_and_reconcile(const std::string& msg_path,
 
     std::string msg_line, book_line;
     std::vector<PubLevel> pub_asks, pub_bids;
+    bool seeded = false;
 
     while (std::getline(msg_file, msg_line)) {
         if (msg_line.empty()) continue;
@@ -222,12 +223,61 @@ inline bool replay_and_reconcile(const std::string& msg_path,
             return false;
         }
 
-        apply_message(book, m, st);
-
         if (!parse_book_row(book_line, levels, pub_asks, pub_bids)) {
             err = "malformed orderbook row at line " + std::to_string(st.messages);
             return false;
         }
+
+        // Warm-start seeding: LOBSTER's message stream begins at market open,
+        // but NASDAQ's actual book at that instant is not empty — resting
+        // liquidity established by the opening cross (and any pre-window
+        // order flow) has no corresponding "new order" message in this file.
+        // The venue's published first row can therefore show real depth that
+        // a from-empty replay could never produce on its own.
+        //
+        // We bootstrap around this by inferring the implied state strictly
+        // BEFORE message 1: take row 1 as published, and if message 1 is a
+        // plain new-limit insert (the overwhelmingly common case), subtract
+        // its own contribution back out of the one level it created. What
+        // remains is pre-existing liquidity with no message provenance in
+        // this file, which we seed as resting orders under synthetic IDs
+        // (clearly out of range of any real LOBSTER order ID) so depth and
+        // volume reconcile correctly. Message 1 is then applied for real,
+        // through the normal path below, restoring row 1 exactly.
+        //
+        // Residual caveat: if a LATER message references one of these seeded
+        // synthetic orders by its real (unrecoverable) LOBSTER id — e.g. the
+        // venue eventually cancels or executes against pre-existing liquidity
+        // we never had a true id for — that reference resolves as unknown
+        // (tallied in Stats::unknown_refs) and the seeded quantity goes
+        // stale. This is an inherent limit of reconstructing from a
+        // message-only stream, not a defect in the reconciliation logic.
+        if (!seeded) {
+            auto seed_asks = pub_asks;
+            auto seed_bids = pub_bids;
+            if (static_cast<Event>(m.event) == Event::NEW_LIMIT) {
+                auto& side = (m.direction == 1) ? seed_bids : seed_asks;
+                for (auto& lvl : side) {
+                    if (lvl.present && lvl.price == static_cast<int64_t>(m.price)) {
+                        lvl.size -= m.size;
+                        if (lvl.size <= 0) lvl.present = false;
+                        break;
+                    }
+                }
+            }
+            uint64_t synthetic_id = 900000000000ULL;
+            for (const auto& lvl : seed_bids)
+                if (lvl.present)
+                    book.insert_order(synthetic_id++, static_cast<uint32_t>(lvl.price),
+                                      static_cast<uint32_t>(lvl.size), true);
+            for (const auto& lvl : seed_asks)
+                if (lvl.present)
+                    book.insert_order(synthetic_id++, static_cast<uint32_t>(lvl.price),
+                                      static_cast<uint32_t>(lvl.size), false);
+            seeded = true;
+        }
+
+        apply_message(book, m, st);
 
         std::string side_err;
         if (!compare_side(book.get_ask_depth(levels), pub_asks, "ask", side_err) ||

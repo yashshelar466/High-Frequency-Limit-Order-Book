@@ -107,6 +107,38 @@ void test_reconciles_clean_stream() {
     std::cout << "[PASS] LOBSTER Replay Reconciles Clean Stream Test" << std::endl;
 }
 
+void test_reconciles_preexisting_opening_liquidity() {
+    // LOBSTER's message stream starts at market open, but the venue's actual
+    // book at that instant already holds resting liquidity established
+    // before the capture window (the opening cross, carryover orders), with
+    // no corresponding "new order" message in the file. The very first
+    // published row can therefore show real depth beyond what message 1
+    // alone explains. This reproduces that shape: message 1 accounts for
+    // only the best bid; the second bid level and both ask levels are
+    // phantom, pre-existing liquidity the replayer must bootstrap around.
+    std::vector<std::string> messages = {
+        "34200.0,1,500,10,5850000,1",   // new buy limit order, id 500, size 10 @ 5850000
+    };
+    std::vector<std::string> rows = {
+        book_row({{5851000, 100}, {5852000, 50}},   // ask levels: entirely phantom
+                {{5850000, 10}, {5849000, 200}}),   // bid 1: message 1's own order; bid 2: phantom
+    };
+    write_file("lobster_warm_message.csv", messages);
+    write_file("lobster_warm_orderbook.csv", rows);
+
+    lobster::Stats st;
+    std::string err;
+    bool ok = lobster::replay_and_reconcile(
+        "lobster_warm_message.csv", "lobster_warm_orderbook.csv", LEVELS, st, err);
+
+    if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
+    CHECK(ok);
+    CHECK(st.messages == 1);
+    CHECK(st.unexpected_trades == 0);
+
+    std::cout << "[PASS] LOBSTER Replay Reconciles Pre-Existing Opening Liquidity Test" << std::endl;
+}
+
 void test_detects_corrupted_book() {
     Fixture fx = build_fixture();
     // Corrupt one published size mid-stream. A reconciler that actually
@@ -149,6 +181,7 @@ void test_detects_dropped_message() {
 
 void cleanup() {
     for (const char* f : {"lobster_fixture_message.csv", "lobster_fixture_orderbook.csv",
+                          "lobster_warm_message.csv", "lobster_warm_orderbook.csv",
                           "lobster_bad_message.csv", "lobster_bad_orderbook.csv",
                           "lobster_drop_message.csv", "lobster_drop_orderbook.csv"}) {
         std::remove(f);
@@ -160,6 +193,7 @@ void cleanup() {
 int main() {
     std::cout << "--- Running LOBSTER Replay Tests ---" << std::endl;
     test_reconciles_clean_stream();
+    test_reconciles_preexisting_opening_liquidity();
     test_detects_corrupted_book();
     test_detects_dropped_message();
     cleanup();
