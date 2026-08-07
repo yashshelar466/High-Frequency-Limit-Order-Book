@@ -141,29 +141,39 @@ reproducible from a clean checkout. Generated CSVs are gitignored.
 
 ## Running it on real market data
 
-The pipeline is data-agnostic. Download a free sample day from
-[LOBSTER](https://lobsterdata.com/info/DataSamples.php) into `data/`, then:
+Download a free sample day from [LOBSTER](https://lobsterdata.com/info/DataSamples.php) into
+`data/` and open **`ofi_study_real.ipynb`**. It runs the replayer itself and needs no edits if
+you have the AAPL 2012-06-21 sample; otherwise change `MSG_PATH` / `BOOK_PATH` in the config
+cell. Everything else — the trimming, the split, the null, the cost model, the overlap
+correction — is identical code to the synthetic study.
 
-```bash
-./build/run_lobster \
-    data/AAPL_2012-06-21_34200000_57600000_message_10.csv \
-    data/AAPL_2012-06-21_34200000_57600000_orderbook_10.csv \
-    5 --recover --emit-features data/features_aapl.csv
-```
+It ships **unexecuted and without conclusions**, which is deliberate. Its markdown says what
+each step does and what would distinguish a finding from an artefact; the final cell prints a
+summary block, and the writeup gets built from that. Deciding what the data means before seeing
+it is how studies like this go wrong.
 
-Point `load_features` at the result and re-run the notebook. Use `--recover`: a top-10 feed is a
-windowed view of the book, so a strict run stops at the first level the message stream cannot
-explain (see the main README's reconciliation section), which for that session is early.
+Beyond the synthetic notebook it adds three things that only matter on real data:
 
-Two caveats to carry into any real-data result. A single ticker-day is one draw — enough to
-demonstrate method, nowhere near enough to claim generalisation. And the deepest levels of a
-top-N feed are structurally unreliable, so features built from them are noisier than they look.
+- **Open/close trimming**, since the first and last minutes are a different process and sit
+  exactly at the edges of a chronological split. The robustness section re-runs the headline
+  number untrimmed, so the choice can be seen not to be carrying the result.
+- **A multiple-testing note.** It also tests signed trade flow and queue imbalance; reporting the
+  best of three predictors inflates its significance, and the permutation null was computed for
+  OFI specifically.
+- **Robustness checks** — interval length, first half vs. second half, trimmed vs. untrimmed.
+  One number from one configuration on one day is not a result.
+
+Two caveats belong in any writeup regardless of what it produces. A single ticker-day is one
+draw — enough to demonstrate method, nowhere near enough to claim generalisation. And the
+deepest levels of a top-N feed are structurally unreliable, which is why the reconciliation
+compares five levels rather than the ten it ingests.
 
 ## Files
 
 | | |
 |---|---|
-| `ofi_study.ipynb` | The study. Executed, with outputs. |
+| `ofi_study.ipynb` | The synthetic study — validation against known ground truth. Executed, with outputs. |
+| `ofi_study_real.ipynb` | The same pipeline pointed at a real LOBSTER session. Ships **unexecuted**: it needs data that is not in this repository, and its conclusions are deliberately left to be written from its own output rather than assumed in advance. |
 | `ofi_lib.py` | Panel construction, forward returns, out-of-sample fitting, permutation null, backtest with costs. |
 | `test_ofi_lib.py` | Tests for the above — forward-return alignment, no backward leakage, chronological-split enforcement, cost arithmetic. |
 | `make_synthetic_lobster.py` | LOBSTER-format generator with known ground truth, on an independent book implementation. |
