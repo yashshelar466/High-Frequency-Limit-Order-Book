@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> positional;
     bool recover = false;
     bool resync = false;
+    bool published_features = false;
     std::string features_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -27,6 +28,8 @@ int main(int argc, char** argv) {
             recover = true;
         } else if (a == "--resync") {
             resync = true;
+        } else if (a == "--published-features") {
+            published_features = true;
         } else if (a == "--emit-features") {
             if (i + 1 >= argc) {
                 std::cerr << "--emit-features needs an output path\n";
@@ -57,6 +60,16 @@ int main(int argc, char** argv) {
                      "  correction and its depth. Reconciliation can then never\n"
                      "  fail, so this is for feature extraction over a full session,\n"
                      "  never a correctness claim -- read the counts it reports.\n"
+                     "\n"
+                     "  --published-features: take the emitted book state from the\n"
+                     "  venue's published rows instead of our reconstruction, and\n"
+                     "  continue past divergences, reporting the horizon rather than\n"
+                     "  stopping at it. A top-N feed omits events outside its price\n"
+                     "  window, so no reconstruction can track a full session exactly;\n"
+                     "  for a study the venue's own book is the better source, and a\n"
+                     "  drifted reconstruction would feed measurement error into every\n"
+                     "  coefficient. Use this for feature extraction; use the default\n"
+                     "  when you want to measure reconstruction accuracy.\n"
                      "\n"
                      "  --emit-features: write one row per message describing the\n"
                      "  reconstructed book (top of book, depth, OFI, signed trade\n"
@@ -90,11 +103,24 @@ int main(int argc, char** argv) {
     }
 
     const bool ok = lobster::replay_and_reconcile(msg_path, book_path, levels,
-                                                  st, err, recover, resync, sink);
+                                                  st, err, recover, resync, sink,
+                                                  published_features,
+                                                  /*continue_past_divergence=*/
+                                                  published_features);
     if (sink) {
         features.flush();
         std::cout << "Wrote " << rows_written << " feature rows to "
                   << features_path << "\n";
+    }
+
+    if (ok && published_features) {
+        std::cout << "Features taken from the venue's published book.\n";
+        if (st.first_divergence)
+            std::cout << "  independent reconstruction matched exactly for the first "
+                      << st.first_divergence << " messages, then diverged;\n"
+                         "  run without --published-features to stop there and see why.\n";
+        else
+            std::cout << "  our independent reconstruction also matched throughout.\n";
     }
 
     if (!ok) {

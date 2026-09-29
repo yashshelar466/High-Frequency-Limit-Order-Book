@@ -86,6 +86,9 @@ struct Stats {
     // depths — especially at the touch — would point at the engine instead.
     std::vector<uint64_t> resync_by_depth;
     uint64_t unexpected_trades = 0; // engine matched — should never happen
+    // Message index of the first divergence, when the run was told to continue
+    // past it rather than stop. 0 means the session reconciled throughout.
+    uint64_t first_divergence = 0;
 };
 
 // Seeded pre-existing liquidity, keyed by (is_buy, price) -> synthetic order id.
@@ -454,7 +457,9 @@ inline bool replay_and_reconcile(const std::string& msg_path,
                                  size_t levels, Stats& st, std::string& err,
                                  bool recover = false,
                                  bool resync = false,
-                                 const FeatureSink& sink = FeatureSink{}) {
+                                 const FeatureSink& sink = FeatureSink{},
+                                 bool features_from_published = false,
+                                 bool continue_past_divergence = false) {
     std::ifstream msg_file(msg_path);
     if (!msg_file) { err = "cannot open " + msg_path; return false; }
     std::ifstream book_file(book_path);
@@ -596,12 +601,43 @@ inline bool replay_and_reconcile(const std::string& msg_path,
             row.msg_size = m.size;
             row.msg_price = m.price;
 
-            auto bid_top = book.get_bid_depth(DEPTH_LEVELS);
-            auto ask_top = book.get_ask_depth(DEPTH_LEVELS);
-            if (!bid_top.empty()) { row.bid_px = bid_top[0].price; row.bid_sz = bid_top[0].volume; }
-            if (!ask_top.empty()) { row.ask_px = ask_top[0].price; row.ask_sz = ask_top[0].volume; }
-            for (const auto& l : bid_top) row.bid_depth_vol += l.volume;
-            for (const auto& l : ask_top) row.ask_depth_vol += l.volume;
+            // Where the book state comes from.
+            //
+            // `features_from_published` takes it from the venue's own published
+            // row rather than from our reconstruction. For a study, that is the
+            // better source and it is worth being clear why: a top-N feed omits
+            // events outside its price window, so no reconstruction from the
+            // message stream alone can track a full session exactly -- and a
+            // reconstruction that has drifted feeds measurement error straight
+            // into the features, biasing every coefficient computed from them.
+            // The published book is the venue's own assertion of its state and
+            // needs no repair.
+            //
+            // The engine is not thereby demoted to a bystander: it still
+            // replays every message and still reports how far its independent
+            // reconstruction matched the venue exactly, which is what makes the
+            // two files trustworthy in the first place.
+            if (features_from_published) {
+                if (!pub_bids.empty() && pub_bids[0].present) {
+                    row.bid_px = static_cast<uint32_t>(pub_bids[0].price);
+                    row.bid_sz = static_cast<uint64_t>(pub_bids[0].size);
+                }
+                if (!pub_asks.empty() && pub_asks[0].present) {
+                    row.ask_px = static_cast<uint32_t>(pub_asks[0].price);
+                    row.ask_sz = static_cast<uint64_t>(pub_asks[0].size);
+                }
+                for (size_t i = 0; i < pub_bids.size() && i < DEPTH_LEVELS; ++i)
+                    if (pub_bids[i].present) row.bid_depth_vol += pub_bids[i].size;
+                for (size_t i = 0; i < pub_asks.size() && i < DEPTH_LEVELS; ++i)
+                    if (pub_asks[i].present) row.ask_depth_vol += pub_asks[i].size;
+            } else {
+                auto bid_top = book.get_bid_depth(DEPTH_LEVELS);
+                auto ask_top = book.get_ask_depth(DEPTH_LEVELS);
+                if (!bid_top.empty()) { row.bid_px = bid_top[0].price; row.bid_sz = bid_top[0].volume; }
+                if (!ask_top.empty()) { row.ask_px = ask_top[0].price; row.ask_sz = ask_top[0].volume; }
+                for (const auto& l : bid_top) row.bid_depth_vol += l.volume;
+                for (const auto& l : ask_top) row.ask_depth_vol += l.volume;
+            }
 
             bool valid = false;
             row.ofi = ofi.update(row.bid_px, row.bid_sz, row.ask_px, row.ask_sz, valid);
@@ -625,6 +661,13 @@ inline bool replay_and_reconcile(const std::string& msg_path,
         std::string side_err;
         if (!compare_side(book.get_ask_depth(levels), cmp_asks, "ask", side_err) ||
             !compare_side(book.get_bid_depth(levels), cmp_bids, "bid", side_err)) {
+            // Continuing past a divergence is only ever allowed when the
+            // features do not depend on our reconstruction. The horizon is
+            // recorded once and reported; it is a measurement, not a pass.
+            if (continue_past_divergence) {
+                if (st.first_divergence == 0) st.first_divergence = st.messages;
+                continue;
+            }
             err = "divergence at message " + std::to_string(st.messages) +
                   " (event=" + std::to_string(m.event) +
                   " id=" + std::to_string(m.order_id) +

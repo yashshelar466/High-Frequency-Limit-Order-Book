@@ -211,6 +211,48 @@ void test_emission_does_not_change_replay() {
     std::cout << "[PASS] Feature emission leaves the replay unchanged" << std::endl;
 }
 
+// When the reconstruction is exact, the two feature sources must agree.
+//
+// This is what licenses --published-features: it is not a different
+// measurement, it is the same measurement taken from the source that cannot
+// drift. If the two disagreed on data that reconciles perfectly, one of the two
+// paths would be computing something else entirely -- and since the real-data
+// study uses the published path while every other test exercises the engine
+// path, nothing else would catch it.
+void test_published_and_engine_features_agree() {
+    std::vector<lobster::FeatureRow> from_engine, from_published;
+    lobster::Stats s1, s2;
+    std::string e1, e2;
+
+    bool ok1 = lobster::replay_and_reconcile(
+        "feat_message.csv", "feat_orderbook.csv", LEVELS, s1, e1, false, false,
+        [&](const lobster::FeatureRow& r) { from_engine.push_back(r); });
+    bool ok2 = lobster::replay_and_reconcile(
+        "feat_message.csv", "feat_orderbook.csv", LEVELS, s2, e2, false, false,
+        [&](const lobster::FeatureRow& r) { from_published.push_back(r); },
+        /*features_from_published=*/true);
+
+    CHECK(ok1 && ok2);
+    CHECK(from_engine.size() == from_published.size());
+    for (size_t i = 0; i < from_engine.size(); ++i) {
+        const auto& a = from_engine[i];
+        const auto& b = from_published[i];
+        CHECK(a.bid_px == b.bid_px);
+        CHECK(a.bid_sz == b.bid_sz);
+        CHECK(a.ask_px == b.ask_px);
+        CHECK(a.ask_sz == b.ask_sz);
+        CHECK(a.ofi == b.ofi);
+        CHECK(a.quote_valid == b.quote_valid);
+        CHECK(a.signed_trade_sz == b.signed_trade_sz);
+    }
+    // The fixture's book is shallower than DEPTH_LEVELS, so depth sums agree too.
+    for (size_t i = 0; i < from_engine.size(); ++i)
+        CHECK(from_engine[i].bid_depth_vol == from_published[i].bid_depth_vol);
+
+    std::cout << "[PASS] Published and engine feature sources agree when exact"
+              << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +260,7 @@ int main() {
     test_ofi_values();
     test_one_sided_book_breaks_chain();
     test_emission_does_not_change_replay();
+    test_published_and_engine_features_agree();
     std::cout << "\n--- All Feature Emitter Tests Passed ---" << std::endl;
     return 0;
 }
