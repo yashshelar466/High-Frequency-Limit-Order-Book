@@ -1,110 +1,121 @@
 # Order Flow Imbalance: a microstructure study on top of the matching engine
 
-The engine in this repository reconstructs a limit order book from a raw exchange message
-stream and verifies it against the venue's own published book. That makes it infrastructure.
-This directory uses it to ask a research question, which is a different kind of work: **does
-the shape of order flow predict where the price goes next, and is the answer worth trading?**
+The engine in this repository reconstructs a limit order book from a raw exchange message stream
+and verifies it against the venue's own published book. That makes it infrastructure. This
+directory uses it to ask a research question, which is different work: **does the shape of order
+flow predict where the price goes next, and is the answer worth trading?**
 
-The short version: **yes, and no** — with the "no" resting on a correction that only shows up
-if you look for it.
+Measured on a real NASDAQ session — every message AAPL's order book received on 21 June 2012 —
+the answer is **yes, and emphatically no.** Order flow imbalance carries real out-of-sample
+predictive power. It is roughly thirty times too small to pay for the spread it would have to
+cross.
+
+Two notebooks:
+
+- [`ofi_study_real.ipynb`](ofi_study_real.ipynb) — the study, on AAPL 2012-06-21.
+- [`ofi_study.ipynb`](ofi_study.ipynb) — the same pipeline on synthetic data with **known ground
+  truth**. This is the validation step, and it ran first: it establishes that the estimator finds
+  an injected relationship, reports approximately zero when the predictor is permuted, and that
+  the forward-return alignment is what it claims to be. Every failure mode in a study like this
+  produces a confident, plausible, false result, and real data offers no way to detect any of
+  them because nobody knows the right answer.
 
 ---
 
 ## The question
 
-At the close of each fixed time interval, measure *order flow imbalance* (OFI) — the net
-pressure applied to the best bid and offer over that interval, in the sense of
+At the close of each fixed time interval, measure *order flow imbalance* (OFI) — the net pressure
+applied to the best bid and offer over that interval, in the sense of
 [Cont, Kukanov & Stoikov (2014)](https://doi.org/10.1093/jjfinec/nbs014):
 
 $$e_n = \mathbb{1}_{\{P^b_n \ge P^b_{n-1}\}} q^b_n - \mathbb{1}_{\{P^b_n \le P^b_{n-1}\}} q^b_{n-1} - \mathbb{1}_{\{P^a_n \le P^a_{n-1}\}} q^a_n + \mathbb{1}_{\{P^a_n \ge P^a_{n-1}\}} q^a_{n-1}$$
 
-Then regress the mid-price change over the *following* interval on $\sum_n e_n$. The predictor
-is measured strictly inside interval $t$; the target is composed entirely of movement after
-interval $t$ closes.
+Then regress the mid-price change over the *following* interval on $\sum_n e_n$. The predictor is
+measured strictly inside interval $t$; the target is composed entirely of movement after interval
+$t$ closes.
 
-## Findings
+## Findings — AAPL, 2012-06-21
 
-Measured on 60,000 messages (20 minutes of simulated session, 599 two-second intervals,
-chronological 70/30 train/test split).
+400,390 two-sided book updates over the full 6.5-hour session, aggregated into 11,129 two-second
+intervals, split chronologically 70/30 (7,790 train / 3,339 test).
+
+### The signal is real, and small
 
 | | out-of-sample R² |
 |---|---|
-| Contemporaneous (same interval) — *price impact, not a forecast* | 0.251 |
-| **Predictive (next interval)** | **0.090** |
-| Permutation null, 500 trials (mean / 95th pct) | −0.003 / 0.008 |
+| Contemporaneous (same interval) — *price impact, not a forecast* | **0.359** |
+| **Predictive (next interval)** | **0.0118** |
+| Permutation null, 500 trials (mean) | −0.00015 |
 
-The predictive result is real: empirical p-value 0.0000 against the permutation null, and the
-horizon profile is smooth and single-peaked rather than spiking at one convenient lag.
+β = +4.41e−4 ticks per unit of OFI — the sign the economics predicts — with an empirical p-value
+of 0.0000 against a permutation null sitting on zero.
 
-It is also about a third the strength of the contemporaneous relationship. Consuming the offer
-both creates positive OFI and raises the mid, so the contemporaneous number is close to
-mechanical. Reporting it as though it were a forecast is the easiest way to oversell this
-analysis, and it is done constantly.
+The contemporaneous relationship is **thirty times stronger than the predictive one**. That gap
+is the whole distinction between explaining the present and forecasting the future. Consuming the
+offer both creates positive OFI and raises the mid, so the contemporaneous number is close to
+mechanical; reporting it as though it were a forecast is the easiest way to oversell this work.
 
-### The signal does not pay for the spread
+### It cannot pay for the spread, and not marginally
 
-A round trip crosses the spread twice, so it pays one full spread before the prediction has to
-be right about anything.
+| | |
+|---|---|
+| Gross edge per trade | **+0.427 ticks** |
+| Cost per round trip (one full spread) | 12.06 ticks |
+| **Net per trade** | **−11.63 ticks** (t = −104.3, 3,339 independent trades) |
+| Hit rate | 0.392 |
 
-| threshold (ticks) | trades | hit rate | gross/trade | cost/trade | **net/trade** |
-|---|---|---|---|---|---|
-| 0.00 | 180 | 0.678 | +0.733 | 2.136 | **−1.403** |
-| 0.10 | 172 | 0.686 | +0.765 | 2.055 | **−1.290** |
-| 0.50 | 137 | 0.715 | +0.964 | 1.709 | **−0.746** |
+NASDAQ's book quoted a median spread of 15 ticks that day, which is wide. The conclusion does not
+depend on it: **the gross edge is 0.427 ticks and the smallest spread that can exist is 1 tick.**
+Against a hypothetical permanently one-tick market the signal still recovers only 43% of the cost
+of crossing. There is no market condition in which this trades profitably as a liquidity-taking
+strategy.
 
-The hit rate is 68% and the strategy still loses on every threshold, which is the whole lesson
-about direction accuracy as a metric. **Breakeven spread: 0.733 ticks against 2.136 quoted** —
-the spread would have to fall by two thirds.
+The hit rate is worth a second look: the signal is directionally *right* less than 40% of the
+time, yet gross PnL per trade is positive, because its wins are bigger than its losses. Direction
+accuracy is not edge, in either direction.
 
-### The correction that changes the conclusion
+### Every horizon loses, significantly
 
-The cost is paid once per round trip, but the gross edge keeps growing with the holding period.
-Hold longer and the net turns positive:
-
-| horizon | trades | gross/trade | net/trade |
+| horizon | independent trades | net/trade | t-stat |
 |---|---|---|---|
-| 2 s | 180 | +0.73 | −1.40 |
-| 10 s | 179 | +3.24 | **+1.10** |
-| 20 s | 177 | +5.61 | **+3.46** |
+| 2 s | 3,339 | −11.63 | −104.3 |
+| 4 s | 1,670 | −11.43 | −57.7 |
+| 10 s | 668 | −11.64 | −25.6 |
+| 20 s | 334 | −10.81 | −13.3 |
+| 40 s | 167 | −8.97 | −6.2 |
+| 80 s | 84 | −6.63 | −2.1 |
 
-That table is where a careless writeup declares a profitable strategy. It is double counting.
-Entering every interval while holding for $h$ intervals means each trade overlaps the next
-$h-1$; one favourable move is counted up to $h$ times. Thinning to disjoint holding windows and
-attaching a $t$-statistic:
+Trades are thinned to **disjoint holding windows** before this table is computed. Entering every
+interval while holding for *h* intervals makes each trade overlap the next *h*−1, counting one
+favourable move up to *h* times and inflating the apparent sample without adding information. On
+the synthetic data that correction was decisive — it turned an apparently profitable long-horizon
+strategy into 18 independent trades at t ≈ 1.7, too few to claim anything. Here it changes
+nothing: every horizon loses and every one is significant.
 
-| horizon | **independent** trades | net/trade | t-stat |
-|---|---|---|---|
-| 2 s | 180 | −1.40 | **−7.55** |
-| 4 s | 90 | −0.74 | **−2.10** |
-| 10 s | 36 | +1.48 | 1.45 |
-| 20 s | 18 | +3.91 | 1.70 |
-| 40 s | 9 | +5.10 | 0.71 |
+### The horizon profile decays — as predicted in advance
 
-At the horizons with enough independent trades to support a claim, the strategy loses
-decisively. Where it appears to win, 9–36 trades at $t \approx 1.5$ cannot distinguish an edge
-from luck.
+R² falls monotonically: 0.0118 → 0.0045 → 0.0031 → 0.0005 from 2 to 20 seconds.
 
-Note the asymmetry: **the losing result is the robust one and the winning result is the fragile
-one.** Short horizons give many independent observations and a clean verdict; long horizons give
-a flattering average and almost no statistical power. A backtest reporting only the second
-misstates nothing in particular and is still worthless.
+On the synthetic data it *rose* to a peak near 20 seconds, because that generator injects an
+autocorrelated drift the visible book adjusts to slowly. That difference was written down, and
+the prediction that real AAPL would decay instead was recorded, **before this notebook was run
+against real data**. Confirming it is modest evidence that the pipeline measures the
+data-generating process rather than itself.
 
-### A nonzero R² is not evidence of information
+### What this does not establish
 
-The `uninformed` control has no informed participants at all — flow is noise. It still produces
-an out-of-sample R² of 0.068, with the **opposite sign** (β = −3.4e−4 vs +1.2e−4), purely from
-mechanical liquidity replenishment: the book gets pushed off and springs back. Any study that
-reports a coefficient without checking that its sign matches the economic story it claims could
-be picking up exactly this.
+Nothing about equities generally. **One ticker-day is one draw**, and 21 June 2012 was a sharply
+down day — AAPL fell from about $588 to $577 — so it is a volatile sample, not a representative
+one.
 
----
+LOBSTER is also a **single-venue** feed. This is NASDAQ's own book; the consolidated NBBO across
+all venues would have been tighter than the 15 ticks quoted here, which is exactly why the
+one-tick robustness argument above carries the conclusion rather than the measured spread.
 
-## What the data is, and what it is not
+## The synthetic study, and why it came first
 
-**The data here is synthetic.** No claim in this directory is evidence about any real security.
-
-That is partly circumstance — the free LOBSTER sample is not redistributable and the environment
-this was built in had no network access to it — but starting synthetic would be right regardless.
+[`ofi_study.ipynb`](ofi_study.ipynb) runs this identical pipeline on generated data. It makes no
+claim about any real security, and it was never meant to: it is the validation step.
 Every serious failure mode in a study like this (a forward return overlapping its own predictor,
 a leaking split, a flipped sign) produces a confident, plausible, entirely false result, and
 real data offers no way to detect any of them because nobody knows the right answer. Synthetic

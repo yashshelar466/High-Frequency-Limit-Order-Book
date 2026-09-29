@@ -104,29 +104,36 @@ Separately, this reconciles the *visible* book only — hidden executions are ex
 
 A verified book reconstruction is infrastructure. [`research/`](research/) uses it to ask a
 question: **does order flow imbalance predict where the mid price goes next, and is the answer
-worth trading?** `run_lobster --emit-features` turns the replayer into a feature generator —
-one row per message carrying the reconstructed book state and the OFI increment — and a tested
-analysis library does the statistics.
+worth trading?** `run_lobster --emit-features` turns the replayer into a feature generator, and a
+tested analysis library does the statistics.
 
-The result, in three lines:
+Measured on a real NASDAQ session — every message AAPL's book received on 21 June 2012, 400,390
+book updates over 6.5 hours:
 
-- **The signal is real.** Out-of-sample R² of 0.090 on the next interval's move, against a
-  500-trial permutation null centred at −0.003 (p = 0.0000). It is a third the strength of the
-  *contemporaneous* relationship (0.251), which is price impact and not tradeable.
-- **It does not pay for the spread.** 68% hit rate, +0.73 ticks gross per trade against a 2.14
-  tick spread: **−1.40 ticks net**, at t = −7.55.
-- **Holding longer appears to fix it, and that is an artefact.** Net turns positive past ~10s,
-  but those trades overlap; thinned to independent trades only 18 remain at t ≈ 1.7. The losing
-  result is robust, the winning one is not.
+- **The signal is real.** Out-of-sample R² of **0.0118** on the next interval's move, β of the
+  predicted sign, p = 0.0000 against a 500-trial permutation null sitting on zero.
+- **It is a thirtieth the strength of the *contemporaneous* relationship** (R² 0.359), which is
+  price impact and not a forecast. Quoting that number as though it were tradeable is the most
+  common way this analysis gets oversold.
+- **It cannot pay for the spread.** Gross edge **+0.43 ticks** per trade against a 12-tick round
+  trip: **−11.63 ticks net**, t = −104 on 3,339 independent trades. And the conclusion does not
+  rest on that day's wide spread — the smallest spread that *can* exist is 1 tick, so even in a
+  permanently one-tick market the edge recovers 43% of the cost of crossing.
+- **Every horizon loses significantly**, once trades are thinned to disjoint holding windows so
+  overlapping trades stop counting one favourable move many times.
 
-The data is **synthetic, with known ground truth** — deliberately, since a study that only ever
-sees real data cannot tell a working pipeline from a leaking one. A control dataset with no
-informed flow at all still yields R² = 0.068 (opposite sign), which is the point: a nonzero R²
-is not evidence of information. Running the same pipeline on real LOBSTER data is one command,
-documented in [`research/README.md`](research/README.md).
+[`research/README.md`](research/README.md) has the full write-up, including a hit rate of 0.392
+that still produces positive gross PnL, and what the result does *not* establish — one ticker-day
+is one draw, on a sharply down day, from a single venue.
 
-The generator writes LOBSTER-format files from an order book written independently of the C++
-engine, so replaying them is also a differential test — 60,000 messages, zero divergences.
+The study was validated before it touched real data. A [companion
+notebook](research/ofi_study.ipynb) runs the identical pipeline against synthetic data with known
+ground truth, because every failure mode here — a forward return overlapping its predictor, a
+leaking split, an inverted sign — yields a confident, plausible, false result that real data
+cannot expose. A control dataset with no informed flow at all still produces R² = 0.068 with the
+opposite sign, which is the point: **a nonzero R² is not evidence of information.** That
+synthetic run also predicted, in writing and in advance, that real AAPL's horizon profile would
+*decay* where the simulation's rose. It does.
 
 ## Performance
 
