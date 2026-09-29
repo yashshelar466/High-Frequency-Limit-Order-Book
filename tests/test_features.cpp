@@ -86,7 +86,8 @@ void test_ofi_values() {
     lobster::Stats st;
     std::string err;
     bool ok = lobster::replay_and_reconcile(
-        "feat_message.csv", "feat_orderbook.csv", LEVELS, st, err, /*recover=*/false,
+        "feat_message.csv", "feat_orderbook.csv", LEVELS, st, err,
+        /*recover=*/false, /*resync=*/false,
         [&](const lobster::FeatureRow& r) { got.push_back(r); });
 
     if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
@@ -170,7 +171,8 @@ void test_one_sided_book_breaks_chain() {
     lobster::Stats st;
     std::string err;
     bool ok = lobster::replay_and_reconcile(
-        "feat_gap_message.csv", "feat_gap_orderbook.csv", LEVELS, st, err, false,
+        "feat_gap_message.csv", "feat_gap_orderbook.csv", LEVELS, st, err,
+        false, false,
         [&](const lobster::FeatureRow& r) { got.push_back(r); });
 
     if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
@@ -198,7 +200,7 @@ void test_emission_does_not_change_replay() {
         "feat_message.csv", "feat_orderbook.csv", LEVELS, bare, e1);
     bool ok2 = lobster::replay_and_reconcile(
         "feat_message.csv", "feat_orderbook.csv", LEVELS, sunk, e2,
-        false, [](const lobster::FeatureRow&) {});
+        false, false, [](const lobster::FeatureRow&) {});
 
     CHECK(ok1 == ok2);
     CHECK(bare.messages == sunk.messages);

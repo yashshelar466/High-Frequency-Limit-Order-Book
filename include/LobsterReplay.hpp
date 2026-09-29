@@ -23,13 +23,21 @@
 #include "OrderBook.hpp"
 #include "FeatureEmit.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace lobster {
+
+// Orders we invent — seeded pre-window liquidity, levels adopted in recover
+// mode, size corrections in resync mode — carry ids from this base upward, far
+// out of range of any real LOBSTER order id. It is what lets resync tell our
+// own stand-ins apart from liquidity the venue actually reported.
+constexpr uint64_t SYNTHETIC_ID_BASE = 900000000000ULL;
 
 // LOBSTER event types (column 2 of the message file).
 enum class Event {
@@ -71,6 +79,12 @@ struct Stats {
     uint64_t seed_attributed = 0;   // unknown id resolved against seeded liquidity
     uint64_t recovered_levels = 0;  // published levels adopted in recover mode
     uint64_t pruned_levels = 0;     // phantom levels dropped in recover mode
+    uint64_t resynced_levels = 0;   // tracked levels whose size we corrected
+    uint64_t resynced_shares = 0;   // total absolute share discrepancy corrected
+    // Corrections by depth (index 0 = best price). A correction count that
+    // climbs with depth is the feed's price window; one spread evenly across
+    // depths — especially at the touch — would point at the engine instead.
+    std::vector<uint64_t> resync_by_depth;
     uint64_t unexpected_trades = 0; // engine matched — should never happen
 };
 
@@ -227,6 +241,89 @@ inline size_t recover_missing_levels(OrderBook& book,
     return recovered;
 }
 
+// Correct the SIZE of levels we already track to match the venue ("resync"
+// mode). This is the third and most permissive reading of the data, and it
+// exists because the two stricter ones cannot get through a real session.
+//
+// Recover mode handles levels that are wholly missing or wholly phantom, but a
+// windowed feed also produces *partial* drift: some of a level's shares are
+// cancelled or executed at a moment when that level sits outside the range
+// LOBSTER emits messages for, so the level survives at the wrong size with no
+// message to explain the difference. Replaying AAPL 2012-06-21 hits exactly
+// this at message 1,965 — bid level 5 holds 589 shares against the venue's 500.
+// Strict and recover both stop there, correctly: neither is willing to invent
+// an explanation for 89 missing shares.
+//
+// Resync adopts the venue's size and counts the correction. That makes
+// reconciliation unable to fail, which is precisely why it must never be the
+// default and why every correction is tallied: the count, and its distribution
+// across depth, is the evidence for whether the drift is the feed's windowing
+// (corrections concentrated at the deep end) or a defect in the engine
+// (corrections at the touch, where the message stream is complete).
+//
+// Where we hold too much, the excess is taken from synthetic liquidity first —
+// orders we invented during seeding or recovery — before touching orders the
+// venue actually told us about, so a later message referencing a real id still
+// finds it.
+inline size_t resync_level_sizes(OrderBook& book,
+                                 const std::vector<PubLevel>& pub_asks,
+                                 const std::vector<PubLevel>& pub_bids,
+                                 SeedIndex& seeds, uint64_t& next_synthetic,
+                                 size_t levels, Stats& st) {
+    size_t fixed = 0;
+    if (st.resync_by_depth.size() < levels) st.resync_by_depth.resize(levels, 0);
+
+    auto resync_side = [&](const std::vector<PubLevel>& pub, bool is_buy) {
+        for (size_t i = 0; i < pub.size() && i < levels; ++i) {
+            if (!pub[i].present) continue;
+            uint32_t px = static_cast<uint32_t>(pub[i].price);
+            const PriceLevel* lvl = is_buy ? book.get_bid_level(px)
+                                           : book.get_ask_level(px);
+            if (!lvl) continue;                       // missing entirely: recover's job
+            int64_t ours = static_cast<int64_t>(lvl->total_volume);
+            int64_t theirs = pub[i].size;
+            if (ours == theirs) continue;
+
+            if (theirs > ours) {
+                // Shortfall: add the difference as synthetic liquidity.
+                book.insert_order(next_synthetic, px,
+                                  static_cast<uint32_t>(theirs - ours), is_buy);
+                seeds[{is_buy, px}] = next_synthetic++;
+            } else {
+                // Excess: retire it, preferring orders we invented ourselves.
+                int64_t excess = ours - theirs;
+                std::vector<std::pair<uint64_t, uint32_t>> synthetic, real;
+                for (const Order* o = lvl->head; o; o = o->next) {
+                    if (o->id >= SYNTHETIC_ID_BASE) synthetic.emplace_back(o->id, o->qty);
+                    else                            real.emplace_back(o->id, o->qty);
+                }
+                for (auto* group : {&synthetic, &real}) {
+                    for (auto& entry : *group) {
+                        if (excess <= 0) break;
+                        uint32_t take = static_cast<uint32_t>(
+                            std::min<int64_t>(excess, entry.second));
+                        book.reduce_order(entry.first, take);
+                        excess -= take;
+                    }
+                }
+                // A seeded stand-in we just consumed is no longer a valid
+                // attribution target for later unresolvable messages.
+                auto it = seeds.find({is_buy, px});
+                if (it != seeds.end() && book.get_order_qty(it->second) == 0)
+                    seeds.erase(it);
+            }
+
+            st.resynced_shares += static_cast<uint64_t>(std::llabs(ours - theirs));
+            ++st.resync_by_depth[i];
+            ++fixed;
+        }
+    };
+
+    resync_side(pub_bids, /*is_buy=*/true);
+    resync_side(pub_asks, /*is_buy=*/false);
+    return fixed;
+}
+
 // Drop levels we hold that the venue does not ("recover" mode, second half).
 //
 // The mirror image of recover_missing_levels: liquidity that drifts *below* the
@@ -356,6 +453,7 @@ inline bool replay_and_reconcile(const std::string& msg_path,
                                  const std::string& book_path,
                                  size_t levels, Stats& st, std::string& err,
                                  bool recover = false,
+                                 bool resync = false,
                                  const FeatureSink& sink = FeatureSink{}) {
     std::ifstream msg_file(msg_path);
     if (!msg_file) { err = "cannot open " + msg_path; return false; }
@@ -377,7 +475,7 @@ inline bool replay_and_reconcile(const std::string& msg_path,
     OfiTracker ofi;
     // Synthetic ids stand in for orders we were never given real ids for. Kept
     // across the whole run so opening seeds and later recoveries never collide.
-    uint64_t synthetic_id = 900000000000ULL;
+    uint64_t synthetic_id = SYNTHETIC_ID_BASE;
 
     while (std::getline(msg_file, msg_line)) {
         if (msg_line.empty()) continue;
@@ -472,11 +570,18 @@ inline bool replay_and_reconcile(const std::string& msg_path,
 
         // In recover mode, adopt any published level we hold nothing at before
         // comparing — a windowed feed can surface liquidity it never announced.
-        if (recover) {
+        // Resync implies recover: adopting and pruning whole levels has to
+        // happen before sizes can be compared on the levels that remain.
+        if (recover || resync) {
             st.pruned_levels +=
                 prune_phantom_levels(book, pub_asks, pub_bids, seeds, levels);
             st.recovered_levels +=
                 recover_missing_levels(book, pub_asks, pub_bids, seeds, synthetic_id);
+        }
+        if (resync) {
+            st.resynced_levels +=
+                resync_level_sizes(book, pub_asks, pub_bids, seeds, synthetic_id,
+                                   levels, st);
         }
 
         // Emit the feature row for this update, before the comparison — so a

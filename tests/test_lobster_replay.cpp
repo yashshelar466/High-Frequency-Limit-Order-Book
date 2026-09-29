@@ -259,6 +259,101 @@ void test_recover_mode_adopts_unannounced_level() {
     std::cout << "[PASS] LOBSTER Replay Recover Mode Adopts Unannounced Level Test" << std::endl;
 }
 
+void test_resync_corrects_size_drift() {
+    // The shape that ends a full AAPL 2012-06-21 run: a level BOTH sides track,
+    // at the same price, holding different sizes. Some of its shares were
+    // cancelled while the level sat outside the range LOBSTER emits messages
+    // for, so nothing in the stream accounts for the difference.
+    //
+    // Strict and recover must both refuse this -- neither invents an
+    // explanation for missing shares -- and resync must fix it and count it.
+    std::vector<std::string> messages = {
+        "34200.0,1,500,100,5850000,1",   // msg 1: our own bid, 100 @ 5850000
+        // msg 2: a HIDDEN execution. It is a real trade but it touches no
+        // visible level, so our book is unchanged across this message and the
+        // only difference in row 2 is the drift being tested.
+        "34200.1,5,0,25,5851000,-1",
+    };
+    std::vector<std::string> rows = {
+        book_row({{5852000, 30}}, {{5850000, 100}}),
+        // Row 2: the venue now shows only 60 at our bid level. 40 shares left
+        // with no message: out-of-window drift.
+        book_row({{5852000, 30}}, {{5850000, 60}}),
+    };
+    write_file("lobster_sync_message.csv", messages);
+    write_file("lobster_sync_orderbook.csv", rows);
+
+    // Strict: must fail.
+    {
+        lobster::Stats st;
+        std::string err;
+        bool ok = lobster::replay_and_reconcile(
+            "lobster_sync_message.csv", "lobster_sync_orderbook.csv", LEVELS, st, err);
+        CHECK(!ok);
+        CHECK(st.messages == 2);
+    }
+
+    // Recover: must ALSO fail. Adopting and pruning whole levels cannot explain
+    // a size difference on a level both sides hold, and forgiving it here would
+    // let a genuine arithmetic bug in the engine pass unnoticed.
+    {
+        lobster::Stats st;
+        std::string err;
+        bool ok = lobster::replay_and_reconcile(
+            "lobster_sync_message.csv", "lobster_sync_orderbook.csv", LEVELS, st, err,
+            /*recover=*/true);
+        CHECK(!ok);
+        CHECK(st.resynced_levels == 0);   // recover must not silently resize
+    }
+
+    // Resync: reconciles, and reports exactly what it had to invent.
+    {
+        lobster::Stats st;
+        std::string err;
+        bool ok = lobster::replay_and_reconcile(
+            "lobster_sync_message.csv", "lobster_sync_orderbook.csv", LEVELS, st, err,
+            /*recover=*/false, /*resync=*/true);
+        if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
+        CHECK(ok);
+        CHECK(st.resynced_levels == 1);
+        CHECK(st.resynced_shares == 40);            // the exact discrepancy
+        CHECK(st.resync_by_depth.size() >= 1);
+        CHECK(st.resync_by_depth[0] == 1);          // at the touch, in this fixture
+        CHECK(st.unexpected_trades == 0);
+    }
+
+    std::cout << "[PASS] LOBSTER Replay Resync Corrects And Counts Size Drift Test"
+              << std::endl;
+}
+
+void test_resync_reports_shortfall_as_well_as_excess() {
+    // Drift runs both ways: the venue can show MORE than we hold, when shares
+    // arrived at a level while it sat outside the message window.
+    std::vector<std::string> messages = {
+        "34200.0,1,500,100,5850000,1",
+        "34200.1,5,0,25,5851000,-1",                   // hidden: book unchanged
+    };
+    std::vector<std::string> rows = {
+        book_row({{5852000, 30}}, {{5850000, 100}}),
+        book_row({{5852000, 30}}, {{5850000, 175}}),   // +75 unexplained
+    };
+    write_file("lobster_sync2_message.csv", messages);
+    write_file("lobster_sync2_orderbook.csv", rows);
+
+    lobster::Stats st;
+    std::string err;
+    bool ok = lobster::replay_and_reconcile(
+        "lobster_sync2_message.csv", "lobster_sync2_orderbook.csv", LEVELS, st, err,
+        /*recover=*/false, /*resync=*/true);
+
+    if (!ok) std::cerr << "unexpected divergence: " << err << std::endl;
+    CHECK(ok);
+    CHECK(st.resynced_levels == 1);
+    CHECK(st.resynced_shares == 75);
+
+    std::cout << "[PASS] LOBSTER Replay Resync Handles Shortfall Test" << std::endl;
+}
+
 void test_recover_mode_prunes_phantom_level() {
     // Mirror image of the unannounced-level case, and the shape that ended the
     // depth-10 run on AAPL 2012-06-21: a level we track that the venue does
@@ -380,6 +475,8 @@ int main() {
     test_strict_mode_stops_at_unannounced_level();
     test_recover_mode_adopts_unannounced_level();
     test_recover_mode_prunes_phantom_level();
+    test_resync_corrects_size_drift();
+    test_resync_reports_shortfall_as_well_as_excess();
     test_recover_mode_still_detects_size_mismatch();
     test_detects_corrupted_book();
     test_detects_dropped_message();

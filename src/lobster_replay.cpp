@@ -19,11 +19,14 @@
 int main(int argc, char** argv) {
     std::vector<std::string> positional;
     bool recover = false;
+    bool resync = false;
     std::string features_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--recover") {
             recover = true;
+        } else if (a == "--resync") {
+            resync = true;
         } else if (a == "--emit-features") {
             if (i + 1 >= argc) {
                 std::cerr << "--emit-features needs an output path\n";
@@ -37,8 +40,8 @@ int main(int argc, char** argv) {
 
     if (positional.size() < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <message.csv> <orderbook.csv> [levels] [--recover]"
-                     " [--emit-features <out.csv>]\n"
+                  << " <message.csv> <orderbook.csv> [levels]"
+                     " [--recover|--resync] [--emit-features <out.csv>]\n"
                      "\n"
                      "  Strict (default): stop at the first published level the\n"
                      "  message stream cannot explain, reporting how far the book\n"
@@ -48,6 +51,12 @@ int main(int argc, char** argv) {
                      "  how many adoptions the session needed. A top-N feed omits\n"
                      "  events outside its price window, so such levels can appear\n"
                      "  unannounced; size mismatches and phantom levels still fail.\n"
+                     "\n"
+                     "  --resync: recover, and additionally correct the SIZE of\n"
+                     "  levels we already track to match the venue, counting every\n"
+                     "  correction and its depth. Reconciliation can then never\n"
+                     "  fail, so this is for feature extraction over a full session,\n"
+                     "  never a correctness claim -- read the counts it reports.\n"
                      "\n"
                      "  --emit-features: write one row per message describing the\n"
                      "  reconstructed book (top of book, depth, OFI, signed trade\n"
@@ -81,7 +90,7 @@ int main(int argc, char** argv) {
     }
 
     const bool ok = lobster::replay_and_reconcile(msg_path, book_path, levels,
-                                                  st, err, recover, sink);
+                                                  st, err, recover, resync, sink);
     if (sink) {
         features.flush();
         std::cout << "Wrote " << rows_written << " feature rows to "
@@ -102,14 +111,29 @@ int main(int argc, char** argv) {
     std::cout << "Reconciled " << st.messages
               << " messages against LOBSTER's published top-" << levels
               << " book with zero divergences"
-              << (recover ? " (recover mode).\n" : " (strict mode).\n")
+              << (resync ? " (resync mode).\n"
+                         : recover ? " (recover mode).\n" : " (strict mode).\n")
               << "  skipped: " << st.skipped_hidden << " hidden executions, "
               << st.skipped_cross << " cross, " << st.skipped_halt << " halt\n"
               << "  events attributed to seeded pre-window liquidity: "
               << st.seed_attributed << "\n"
               << "  references to orders not present in the file: "
               << st.unknown_refs << "\n";
-    if (recover) {
+    if (resync) {
+        std::cout << "  tracked levels whose size was corrected to the venue's: "
+                  << st.resynced_levels << " (" << st.resynced_shares
+                  << " shares in total)\n";
+        if (!st.resync_by_depth.empty()) {
+            std::cout << "  corrections by depth (level 1 = touch):";
+            for (size_t i = 0; i < st.resync_by_depth.size(); ++i)
+                std::cout << " L" << (i + 1) << "=" << st.resync_by_depth[i];
+            std::cout << "\n"
+                      << "    Corrections concentrated at the deep end are the\n"
+                         "    feed's price window; corrections at the touch would\n"
+                         "    indicate a defect in the engine instead.\n";
+        }
+    }
+    if (recover || resync) {
         std::cout << "  unexplained levels adopted from the published book: "
                   << st.recovered_levels << "\n"
                   << "  phantom levels pruned (died outside the window): "

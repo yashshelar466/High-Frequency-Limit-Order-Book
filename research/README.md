@@ -144,7 +144,11 @@ reproducible from a clean checkout. Generated CSVs are gitignored.
 Download a free sample day from [LOBSTER](https://lobsterdata.com/info/DataSamples.php) into
 `data/` and open **`ofi_study_real.ipynb`**. It runs the replayer itself and needs no edits if
 you have the AAPL 2012-06-21 sample; otherwise change `MSG_PATH` / `BOOK_PATH` in the config
-cell. Everything else — the trimming, the split, the null, the cost model, the overlap
+cell. It replays with `--resync`, because neither strict nor recover mode can cross a full
+real session — recover stops at message 1,965 on a level whose size drifted while it sat
+outside the feed's price window. Resync corrects such levels and counts every correction;
+the `corrections by depth` histogram it prints is a data-quality measure to read *before*
+the results, since corrections at the touch would undermine the OFI features themselves. Everything else — the trimming, the split, the null, the cost model, the overlap
 correction — is identical code to the synthetic study.
 
 It ships **unexecuted and without conclusions**, which is deliberate. Its markdown says what
