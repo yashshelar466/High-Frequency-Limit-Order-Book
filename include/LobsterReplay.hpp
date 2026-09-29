@@ -677,7 +677,11 @@ inline bool replay_and_reconcile(const std::string& msg_path,
         }
     }
 
-    if (st.unexpected_trades > 0) {
+    // Once the run has been told to continue past divergence, our book is
+    // knowingly wrong, so a crossed state is a downstream consequence of that
+    // rather than new information — and the features do not come from this
+    // book anyway. Report it as reconstruction quality; do not fail the run.
+    if (st.unexpected_trades > 0 && !continue_past_divergence) {
         err = "engine matched " + std::to_string(st.unexpected_trades) +
               " trade(s); LOBSTER events are pre-matched and should never trigger"
               " matching — the book was in a crossed state";

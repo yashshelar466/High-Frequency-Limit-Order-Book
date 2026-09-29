@@ -127,17 +127,25 @@ int main(int argc, char** argv) {
 
     if (ok && published_features) {
         std::cout << "Features taken from the venue's published book.\n";
-        if (st.first_divergence)
+        if (st.first_divergence) {
             std::cout << "  independent reconstruction matched exactly for the first "
-                      << st.first_divergence << " messages, then diverged;\n"
-                         "  run without --published-features to stop there and see why.\n";
-        else
+                      << st.first_divergence << " of " << st.messages << " messages,\n"
+                         "  then diverged; run without --published-features to stop "
+                         "there and see why.\n";
+            if (st.unexpected_trades)
+                std::cout << "  after diverging, our book reached a crossed state "
+                          << st.unexpected_trades << " times.\n"
+                             "  Expected: nothing repairs the book once it is known to be "
+                             "wrong, and the\n  features above do not come from it. It is "
+                             "reported, not hidden.\n";
+        } else {
             std::cout << "  our independent reconstruction also matched throughout.\n";
+        }
     }
 
     if (!ok) {
         std::cerr << "FAILED after " << st.messages << " messages: " << err << "\n";
-        if (!recover) {
+        if (!recover && !published_features) {
             std::cerr << "\nStrict reconstruction horizon: " << st.messages
                       << " messages at depth " << levels
                       << ". Re-run with --recover to continue past unexplained"
