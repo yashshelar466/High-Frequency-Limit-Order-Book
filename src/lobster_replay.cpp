@@ -36,6 +36,18 @@ int main(int argc, char** argv) {
                 return 2;
             }
             features_path = argv[++i];
+        } else if (a.rfind("--", 0) == 0) {
+            // Reject unknown options rather than letting them fall through to
+            // the positional list, where they are silently ignored. That is not
+            // a hypothetical: running an older binary with a flag it predates
+            // produced a plausible, completely misleading result -- the flag
+            // vanished, the run silently used different semantics, and the
+            // output looked like evidence about the data rather than about the
+            // build. A typo'd flag would do the same.
+            std::cerr << "unknown option: " << a << "\n"
+                      << "(run with no arguments for usage; if you expected this "
+                         "flag to exist, your binary may predate it -- rebuild)\n";
+            return 2;
         } else {
             positional.push_back(a);
         }
