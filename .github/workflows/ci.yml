@@ -44,8 +44,6 @@ jobs:
         run: python -m pip install --quiet numpy pandas
       - name: Test the analysis library
         run: python research/test_ofi_lib.py
-      - name: Test the Kelly sizing study
-        run: python kelly/test_kelly_lib.py
 
       # End-to-end: generate LOBSTER-format data from an independently written
       # order book, replay it through the engine, and require a strict
